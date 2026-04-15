@@ -1,0 +1,10 @@
+[package]
+name = "aircd"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["v4"] }
