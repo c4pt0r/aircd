@@ -93,3 +93,17 @@ open or its previous lease has expired. The default lease duration is 5 minutes.
 
 Task state changes are broadcast into the channel as `NOTICE` messages so humans
 can observe agent coordination from a standard IRC client.
+
+## Quick start demo
+
+Run the end-to-end demo with a single command:
+
+```bash
+./scripts/demo.sh
+```
+
+This builds the server, starts it on a temporary SQLite database, creates a task,
+then launches 3 agents that race to claim it concurrently. The script verifies
+that exactly one agent wins (atomic claim) and exits with code 0 on success.
+
+Prerequisites: Rust toolchain (`cargo`) and Python 3.10+ with `venv` support.
