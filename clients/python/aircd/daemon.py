@@ -29,7 +29,7 @@ from argparse import ArgumentParser
 from collections import deque
 from dataclasses import dataclass, field
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from threading import Thread
+from threading import Thread, Lock
 from typing import Optional
 
 from aircd.client import AircdClient, Message
@@ -42,6 +42,9 @@ BUSY_NOTIFICATION_DEBOUNCE = 3.0
 # Maximum pending messages before we force-drain
 MAX_PENDING = 200
 
+# Timeout for synchronous IRC request/response (seconds)
+IRC_REQUEST_TIMEOUT = 5.0
+
 
 @dataclass
 class AgentState:
@@ -53,6 +56,16 @@ class AgentState:
     pending_inbox: deque = field(default_factory=deque)
     last_notification_time: float = 0.0
     seen_msg_ids: set = field(default_factory=set)
+
+
+@dataclass
+class SyncRequest:
+    """A synchronous request waiting for IRC responses."""
+
+    event: asyncio.Event = field(default_factory=asyncio.Event)
+    responses: list = field(default_factory=list)
+    channel: str = ""
+    done: bool = False
 
 
 def find_claude_cli() -> str:
@@ -83,11 +96,9 @@ def format_envelope(msg: Message) -> str:
     """Format an IRC message into slock-style envelope string."""
     parts = [f"target={msg.channel}"]
     if msg.raw:
-        # Extract msg-id from raw IRC tags
         m = re.search(r"msg-id=([^\s;]+)", msg.raw)
         if m:
             parts.append(f"msg={m.group(1)}")
-    # Extract time from raw tags
     if msg.raw:
         m = re.search(r"time=([^\s;]+)", msg.raw)
         if m:
@@ -163,11 +174,12 @@ class DaemonHTTPHandler(BaseHTTPRequestHandler):
             self._respond_json({"error": "not found"}, 404)
 
     def _handle_check_messages(self):
-        """Drain pending inbox and return messages."""
+        """Drain pending delivery buffer and return messages."""
         messages = []
-        while self.daemon.agent.pending_inbox:
-            msg = self.daemon.agent.pending_inbox.popleft()
-            messages.append(message_to_dict(msg))
+        with self.daemon.inbox_lock:
+            while self.daemon.agent.pending_inbox:
+                msg = self.daemon.agent.pending_inbox.popleft()
+                messages.append(message_to_dict(msg))
         self._respond_json({"messages": messages})
 
     def _handle_send_message(self):
@@ -182,8 +194,7 @@ class DaemonHTTPHandler(BaseHTTPRequestHandler):
         self._respond_json({"status": "queued"})
 
     def _handle_history(self):
-        """Queue a CHATHISTORY request and collect responses."""
-        # Parse query params manually
+        """Request CHATHISTORY from IRC server and wait for response."""
         params = {}
         if "?" in self.path:
             query = self.path.split("?", 1)[1]
@@ -200,11 +211,20 @@ class DaemonHTTPHandler(BaseHTTPRequestHandler):
             self._respond_json({"error": "channel required"}, 400)
             return
 
-        # Request history via daemon's IRC client
-        self.daemon.history_requests.append((channel, after_seq, limit))
-        # Return empty for now — history will be delivered asynchronously
-        # In MVP, we return what we can collect synchronously
-        self._respond_json({"messages": [], "note": "history requested, results arrive via check_messages"})
+        # Use sync request to collect CHATHISTORY responses
+        loop = self.daemon._loop
+        if not loop:
+            self._respond_json({"error": "daemon not ready"}, 503)
+            return
+
+        future = asyncio.run_coroutine_threadsafe(
+            self.daemon._request_history(channel, after_seq, limit), loop
+        )
+        try:
+            messages = future.result(timeout=IRC_REQUEST_TIMEOUT)
+            self._respond_json({"messages": messages})
+        except Exception as e:
+            self._respond_json({"error": str(e)}, 500)
 
     def _handle_server_info(self):
         """Return known channels and agent info."""
@@ -215,7 +235,7 @@ class DaemonHTTPHandler(BaseHTTPRequestHandler):
         })
 
     def _handle_list_tasks(self):
-        """Queue a TASK LIST request."""
+        """Request TASK LIST from IRC server and wait for response."""
         params = {}
         if "?" in self.path:
             query = self.path.split("?", 1)[1]
@@ -229,8 +249,19 @@ class DaemonHTTPHandler(BaseHTTPRequestHandler):
             self._respond_json({"error": "channel required"}, 400)
             return
 
-        self.daemon.task_requests.append(("list", channel))
-        self._respond_json({"tasks": [], "note": "task list requested"})
+        loop = self.daemon._loop
+        if not loop:
+            self._respond_json({"error": "daemon not ready"}, 503)
+            return
+
+        future = asyncio.run_coroutine_threadsafe(
+            self.daemon._request_task_list(channel), loop
+        )
+        try:
+            tasks = future.result(timeout=IRC_REQUEST_TIMEOUT)
+            self._respond_json({"tasks": tasks})
+        except Exception as e:
+            self._respond_json({"error": str(e)}, 500)
 
     def _handle_task_claim(self):
         body = self._read_body()
@@ -278,15 +309,23 @@ class Daemon:
 
         self.irc: Optional[AircdClient] = None
         self.agent = AgentState()
+        self.inbox_lock = Lock()
         self.outgoing_queue: deque = deque()
-        self.history_requests: deque = deque()
         self.task_requests: deque = deque()
 
+        # Sync request/response slots for history and task list
+        self._history_request: Optional[SyncRequest] = None
+        self._task_list_request: Optional[SyncRequest] = None
+
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._notification_task: Optional[asyncio.Task] = None
         self._shutdown = False
+        self._initial_connect = True
 
     async def run(self):
         """Main daemon loop."""
+        self._loop = asyncio.get_event_loop()
+
         # Start local HTTP API for the MCP bridge
         self._start_http_server()
 
@@ -356,11 +395,11 @@ class Daemon:
 
         args = [
             claude_bin,
+            "--dangerously-skip-permissions",
             "--input-format", "stream-json",
             "--output-format", "stream-json",
             "--mcp-config", self._mcp_config_file.name,
             "--model", self.claude_model,
-            "--allowedTools", "mcp__chat__*",
         ]
 
         if self.agent.session_id:
@@ -388,8 +427,9 @@ class Daemon:
 
         # Send initial prompt via stdin
         stdin_msg = encode_stdin_message(initial_prompt, self.agent.session_id)
-        proc.stdin.write((stdin_msg + "\n").encode("utf-8"))
-        proc.stdin.flush()
+        if proc.stdin:
+            proc.stdin.write((stdin_msg + "\n").encode("utf-8"))
+            proc.stdin.flush()
 
         # Start stdout reader in background
         asyncio.create_task(self._claude_stdout_reader())
@@ -408,7 +448,6 @@ class Daemon:
             try:
                 line = await loop.run_in_executor(None, proc.stdout.readline)
                 if not line:
-                    # Process exited
                     logger.info("Claude process exited")
                     self.agent.is_busy = False
                     break
@@ -426,7 +465,6 @@ class Daemon:
                 event_type = event.get("type", "")
 
                 if event_type == "system":
-                    # Extract session ID
                     sid = event.get("session_id")
                     if sid:
                         self.agent.session_id = sid
@@ -437,8 +475,10 @@ class Daemon:
                     self.agent.is_busy = False
                     logger.debug("Claude turn completed, now idle")
 
-                    # Check if there are pending messages to deliver
-                    if self.agent.pending_inbox:
+                    # Deliver any pending messages
+                    with self.inbox_lock:
+                        has_pending = bool(self.agent.pending_inbox)
+                    if has_pending:
                         await self._deliver_pending_idle()
 
             except Exception as e:
@@ -447,12 +487,16 @@ class Daemon:
 
     async def _deliver_pending_idle(self):
         """Deliver pending messages directly via stdin when Claude is idle."""
-        if not self.agent.pending_inbox or not self.agent.process:
+        proc = self.agent.process
+        if not proc or not proc.stdin:
             return
 
-        messages = []
-        while self.agent.pending_inbox:
-            messages.append(self.agent.pending_inbox.popleft())
+        with self.inbox_lock:
+            if not self.agent.pending_inbox:
+                return
+            messages = []
+            while self.agent.pending_inbox:
+                messages.append(self.agent.pending_inbox.popleft())
 
         text = "\n".join(
             f"New message received:\n\n{format_envelope(m)}"
@@ -462,26 +506,28 @@ class Daemon:
 
         stdin_msg = encode_stdin_message(text, self.agent.session_id)
         try:
-            self.agent.process.stdin.write((stdin_msg + "\n").encode("utf-8"))
-            self.agent.process.stdin.flush()
+            proc.stdin.write((stdin_msg + "\n").encode("utf-8"))
+            proc.stdin.flush()
             self.agent.is_busy = True
             logger.info("Delivered %d pending messages (idle mode)", len(messages))
         except (BrokenPipeError, OSError) as e:
             logger.error("Failed to write to Claude stdin: %s", e)
-            # Re-queue messages
-            for m in reversed(messages):
-                self.agent.pending_inbox.appendleft(m)
+            with self.inbox_lock:
+                for m in reversed(messages):
+                    self.agent.pending_inbox.appendleft(m)
 
     async def _deliver_busy_notification(self):
         """Send a notification to Claude that new messages are waiting."""
-        if not self.agent.process or not self.agent.is_busy:
+        proc = self.agent.process
+        if not proc or not proc.stdin or not self.agent.is_busy:
             return
 
         now = time.time()
         if now - self.agent.last_notification_time < BUSY_NOTIFICATION_DEBOUNCE:
             return
 
-        count = len(self.agent.pending_inbox)
+        with self.inbox_lock:
+            count = len(self.agent.pending_inbox)
         if count == 0:
             return
 
@@ -492,15 +538,47 @@ class Daemon:
 
         stdin_msg = encode_stdin_message(notification, self.agent.session_id)
         try:
-            self.agent.process.stdin.write((stdin_msg + "\n").encode("utf-8"))
-            self.agent.process.stdin.flush()
+            proc.stdin.write((stdin_msg + "\n").encode("utf-8"))
+            proc.stdin.flush()
             self.agent.last_notification_time = now
             logger.debug("Sent busy notification (%d pending)", count)
         except (BrokenPipeError, OSError) as e:
             logger.error("Failed to send notification: %s", e)
 
+    async def _request_history(self, channel: str, after_seq: int, limit: int) -> list:
+        """Send CHATHISTORY and collect replay responses synchronously."""
+        req = SyncRequest(channel=channel)
+        self._history_request = req
+
+        await self.irc.history(channel, after_seq, limit)
+
+        # Wait for responses with timeout — the reader loop will collect
+        # replay-tagged messages and signal when done
+        try:
+            await asyncio.wait_for(req.event.wait(), timeout=IRC_REQUEST_TIMEOUT)
+        except asyncio.TimeoutError:
+            pass
+
+        self._history_request = None
+        return req.responses
+
+    async def _request_task_list(self, channel: str) -> list:
+        """Send TASK LIST and collect response NOTICEs synchronously."""
+        req = SyncRequest(channel=channel)
+        self._task_list_request = req
+
+        await self.irc.task_list(channel)
+
+        try:
+            await asyncio.wait_for(req.event.wait(), timeout=IRC_REQUEST_TIMEOUT)
+        except asyncio.TimeoutError:
+            pass
+
+        self._task_list_request = None
+        return req.responses
+
     async def _irc_reader_loop(self):
-        """Read messages from IRC and route to Claude."""
+        """Read messages from IRC and route to Claude or sync requests."""
         async for msg in self.irc.messages():
             if self._shutdown:
                 break
@@ -509,10 +587,63 @@ class Daemon:
             if msg.sender == self.nick:
                 continue
 
-            # Skip replay messages — they're catch-up from bouncer
-            if msg.is_replay:
-                logger.debug("Skipping replay: %s", msg.content[:80])
+            # Check if this is a response to a sync history request
+            if msg.is_replay and self._history_request:
+                req = self._history_request
+                if msg.channel == req.channel:
+                    req.responses.append(message_to_dict(msg))
+                    # Schedule a short delay to collect batch, then signal done
+                    if not req.done:
+                        req.done = True
+                        asyncio.create_task(self._finalize_sync_request(req, 0.5))
+                    continue
+
+            # Check if this is a TASK LIST response (NOTICE from server)
+            if (self._task_list_request
+                    and msg.sender in ("aircd", "server")
+                    and "TASK " in msg.content):
+                req = self._task_list_request
+                # Parse task list line: TASK <id> channel=<ch> status=<s> ...
+                task_match = re.match(
+                    r"TASK\s+(\S+)\s+channel=(\S+)\s+status=(\S+)\s+"
+                    r"claimed_by=(\S+)\s+lease_expires_at=(\S+)\s+title=:(.*)",
+                    msg.content,
+                )
+                if task_match:
+                    req.responses.append({
+                        "id": task_match.group(1),
+                        "channel": task_match.group(2),
+                        "status": task_match.group(3),
+                        "claimed_by": task_match.group(4),
+                        "title": task_match.group(6),
+                    })
+                    if not req.done:
+                        req.done = True
+                        asyncio.create_task(self._finalize_sync_request(req, 0.5))
                 continue
+
+            # On initial connect, deliver replay messages as context
+            if msg.is_replay and self._initial_connect:
+                logger.debug("Replay (initial connect): [%s] %s: %s",
+                             msg.channel, msg.sender, msg.content[:80])
+                with self.inbox_lock:
+                    self.agent.pending_inbox.append(msg)
+                continue
+
+            # Skip replay messages after initial connect (reconnect catch-up
+            # is handled by the bouncer; we don't re-deliver to Claude)
+            if msg.is_replay:
+                logger.debug("Skipping replay (reconnect): %s", msg.content[:80])
+                continue
+
+            # Mark initial connect phase as over once we see a live message
+            if self._initial_connect:
+                self._initial_connect = False
+                # Deliver any collected replay messages
+                with self.inbox_lock:
+                    has_pending = bool(self.agent.pending_inbox)
+                if has_pending and not self.agent.is_busy:
+                    await self._deliver_pending_idle()
 
             # Dedup by msg-id
             msg_id = ""
@@ -524,22 +655,26 @@ class Daemon:
                 continue
             if msg_id:
                 self.agent.seen_msg_ids.add(msg_id)
-                # Cap the seen set
                 if len(self.agent.seen_msg_ids) > 10000:
                     self.agent.seen_msg_ids.clear()
 
             logger.info("[%s] %s: %s", msg.channel, msg.sender, msg.content[:80])
 
             if self.agent.is_busy:
-                # Queue and notify
-                self.agent.pending_inbox.append(msg)
-                if len(self.agent.pending_inbox) > MAX_PENDING:
-                    self.agent.pending_inbox.popleft()
+                with self.inbox_lock:
+                    self.agent.pending_inbox.append(msg)
+                    if len(self.agent.pending_inbox) > MAX_PENDING:
+                        self.agent.pending_inbox.popleft()
                 await self._deliver_busy_notification()
             else:
-                # Deliver directly via stdin
-                self.agent.pending_inbox.append(msg)
+                with self.inbox_lock:
+                    self.agent.pending_inbox.append(msg)
                 await self._deliver_pending_idle()
+
+    async def _finalize_sync_request(self, req: SyncRequest, delay: float):
+        """Wait a short time for more responses, then signal done."""
+        await asyncio.sleep(delay)
+        req.event.set()
 
     async def _outgoing_sender_loop(self):
         """Send queued outgoing messages via IRC."""
@@ -554,23 +689,12 @@ class Daemon:
             await asyncio.sleep(0.1)
 
     async def _command_processor_loop(self):
-        """Process queued IRC commands (history, tasks)."""
+        """Process queued IRC commands (task claim/done)."""
         while not self._shutdown:
-            # Process history requests
-            while self.history_requests:
-                channel, after_seq, limit = self.history_requests.popleft()
-                try:
-                    await self.irc.history(channel, after_seq, limit)
-                except Exception as e:
-                    logger.error("History request failed: %s", e)
-
-            # Process task requests
             while self.task_requests:
                 action, arg = self.task_requests.popleft()
                 try:
-                    if action == "list":
-                        await self.irc.task_list(arg)
-                    elif action == "claim":
+                    if action == "claim":
                         await self.irc.task_claim(arg)
                     elif action == "done":
                         await self.irc.task_done(arg)
