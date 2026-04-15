@@ -120,21 +120,24 @@ async def e2e_test():
     print(f'  Human sends: {test_msg}')
     await human.privmsg(CHANNEL, test_msg)
 
-    # Wait for agent reply
+    # Wait for agent reply with a real wall-clock timeout
     print(f'  Waiting for agent reply (timeout {TIMEOUT}s)...')
     start = time.time()
     agent_reply = None
 
-    async for msg in human.messages():
-        elapsed = time.time() - start
-        if elapsed > TIMEOUT:
-            break
+    async def wait_for_reply():
+        nonlocal agent_reply
+        async for msg in human.messages():
+            if msg.sender == 'agent-a' and msg.channel == CHANNEL:
+                elapsed = time.time() - start
+                agent_reply = msg
+                print(f'  Agent replied ({elapsed:.1f}s): {msg.content[:200]}')
+                return
 
-        # Look for a message from agent-a (not from human, not system)
-        if msg.sender == 'agent-a' and msg.channel == CHANNEL:
-            agent_reply = msg
-            print(f'  Agent replied ({elapsed:.1f}s): {msg.content[:200]}')
-            break
+    try:
+        await asyncio.wait_for(wait_for_reply(), timeout=TIMEOUT)
+    except asyncio.TimeoutError:
+        pass
 
     await human.close()
 

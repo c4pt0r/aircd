@@ -416,6 +416,7 @@ class Daemon:
         args = [
             claude_bin,
             "--dangerously-skip-permissions",
+            "--verbose",
             "--input-format", "stream-json",
             "--output-format", "stream-json",
             "--mcp-config", self._mcp_config_file.name,
@@ -451,8 +452,9 @@ class Daemon:
             proc.stdin.write((stdin_msg + "\n").encode("utf-8"))
             proc.stdin.flush()
 
-        # Start stdout reader in background
+        # Start stdout and stderr readers in background
         asyncio.create_task(self._claude_stdout_reader())
+        asyncio.create_task(self._claude_stderr_reader())
         self.agent.is_busy = True
 
         logger.info("Claude started (PID %d)", proc.pid)
@@ -510,6 +512,24 @@ class Daemon:
 
             except Exception as e:
                 logger.error("Error reading Claude stdout: %s", e)
+                break
+
+    async def _claude_stderr_reader(self):
+        """Read Claude's stderr and log it for diagnostics."""
+        proc = self.agent.process
+        if not proc or not proc.stderr:
+            return
+
+        loop = asyncio.get_event_loop()
+        while not self._shutdown:
+            try:
+                line = await loop.run_in_executor(None, proc.stderr.readline)
+                if not line:
+                    break
+                line_str = line.decode("utf-8", errors="replace").strip()
+                if line_str:
+                    logger.warning("Claude stderr: %s", line_str)
+            except Exception:
                 break
 
     async def _deliver_pending_idle(self):
@@ -684,7 +704,11 @@ class Daemon:
                 tag_actor = msg.tags.get("task-actor", "")
                 if tag_task_id and tag_action and tag_status:
                     if tag_task_id == req.task_id and tag_action == req.action:
-                        if tag_status == "success" and tag_actor == self.nick:
+                        if tag_status == "failed":
+                            req.responses.append({"status": "failed", "error": msg.content})
+                            req.event.set()
+                            continue
+                        elif tag_status == "success" and tag_actor == self.nick:
                             status = "claimed" if tag_action == "claim" else "done"
                             req.responses.append({"status": status, "detail": msg.content})
                             req.event.set()
