@@ -331,7 +331,6 @@ class Daemon:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._notification_task: Optional[asyncio.Task] = None
         self._shutdown = False
-        self._initial_connect = True
 
     async def run(self):
         """Main daemon loop."""
@@ -617,8 +616,6 @@ class Daemon:
 
     async def _irc_reader_loop(self):
         """Read messages from IRC and route to Claude or sync requests."""
-        replay_timer: Optional[asyncio.Task] = None
-
         async for msg in self.irc.messages():
             if self._shutdown:
                 break
@@ -681,36 +678,10 @@ class Daemon:
             if msg.sender == self.nick:
                 continue
 
-            # On initial connect, collect replay messages as context
-            if msg.is_replay and self._initial_connect:
-                logger.debug("Replay (initial connect): [%s] %s: %s",
-                             msg.channel, msg.sender, msg.content[:80])
-                with self.inbox_lock:
-                    self.agent.pending_inbox.append(msg)
-                # Schedule delivery after a short batch window
-                if replay_timer:
-                    replay_timer.cancel()
-                replay_timer = asyncio.create_task(
-                    self._deliver_initial_replay(1.0)
-                )
-                continue
-
-            # Skip replay messages after initial connect (reconnect catch-up
-            # is handled by the bouncer; we don't re-deliver to Claude)
-            if msg.is_replay:
-                logger.debug("Skipping replay (reconnect): %s", msg.content[:80])
-                continue
-
-            # Mark initial connect phase as over once we see a live message
-            if self._initial_connect:
-                self._initial_connect = False
-                if replay_timer:
-                    replay_timer.cancel()
-                    replay_timer = None
-                with self.inbox_lock:
-                    has_pending = bool(self.agent.pending_inbox)
-                if has_pending and not self.agent.is_busy:
-                    await self._deliver_pending_idle()
+            # All replay messages (bouncer catch-up on connect or reconnect)
+            # go through normal dedup + delivery. This ensures the wrapper
+            # never drops messages that arrived while disconnected.
+            # Only explicit _history_request replays are consumed above.
 
             # Dedup by msg-id
             msg_id = ""
@@ -742,17 +713,6 @@ class Daemon:
                 with self.inbox_lock:
                     self.agent.pending_inbox.append(msg)
                 await self._deliver_pending_idle()
-
-    async def _deliver_initial_replay(self, delay: float):
-        """After collecting initial replay messages, deliver them to Claude."""
-        await asyncio.sleep(delay)
-        if not self._initial_connect:
-            return  # Already handled by live message arrival
-        self._initial_connect = False
-        with self.inbox_lock:
-            has_pending = bool(self.agent.pending_inbox)
-        if has_pending and not self.agent.is_busy:
-            await self._deliver_pending_idle()
 
     async def _finalize_sync_request(self, req: SyncRequest, delay: float):
         """Wait a short time for more responses, then signal done."""
