@@ -1,12 +1,17 @@
 [project]
 name = "aircd"
-version = "0.1.0"
-description = "Python client library for aircd IRC server"
+version = "0.2.0"
+description = "Python client library and agent runtime for aircd IRC server"
 requires-python = ">=3.10"
 dependencies = []
 
 [project.optional-dependencies]
+daemon = ["mcp>=1.0"]
 dev = ["pytest", "pytest-asyncio"]
+
+[project.scripts]
+aircd-daemon = "aircd.daemon:main"
+aircd-bridge = "aircd.bridge:main"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
