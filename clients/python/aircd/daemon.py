@@ -67,6 +67,7 @@ class SyncRequest:
     responses: list = field(default_factory=list)
     channel: str = ""
     task_id: str = ""
+    action: str = ""
     done: bool = False
 
 
@@ -128,7 +129,75 @@ def message_to_dict(msg: Message) -> dict:
         "time": time_val,
         "seq": msg.seq,
         "is_replay": msg.is_replay,
+        "type": msg.tags.get("type", ""),
+        "tags": msg.tags,
     }
+
+
+def _task_action_result_from_message(
+    msg: Message, req: SyncRequest, self_nick: str
+) -> Optional[dict]:
+    """Return authoritative task action result for a pending request.
+
+    Prefer IRCv3 task metadata tags. Keep the human-readable regex fallback for
+    older servers, but gate it on requested action, task id, and self nick.
+    """
+    if msg.sender not in ("aircd", "server"):
+        return None
+
+    success_status = {
+        "claim": "claimed",
+        "done": "done",
+        "release": "released",
+    }.get(req.action, req.action)
+
+    tags = msg.tags
+    if tags.get("type") == "task" and tags.get("task-id") == req.task_id:
+        if tags.get("task-action") != req.action:
+            return None
+        result = tags.get("task-result")
+        actor = tags.get("task-actor")
+        if result == "error":
+            return {
+                "status": "failed",
+                "error": tags.get("task-error") or msg.content,
+                "detail": msg.content,
+            }
+        if result == "success" and actor == self_nick:
+            return {
+                "status": success_status,
+                "detail": msg.content,
+            }
+        return None
+
+    success_match = re.match(
+        r"TASK\s+(\S+)\s+(claimed|completed|released)\s+by\s+(\S+):",
+        msg.content,
+    )
+    if success_match and success_match.group(1) == req.task_id:
+        event_action = {
+            "claimed": "claim",
+            "completed": "done",
+            "released": "release",
+        }[success_match.group(2)]
+        actor = success_match.group(3)
+        if event_action == req.action and actor == self_nick:
+            return {
+                "status": success_status,
+                "detail": msg.content,
+            }
+        return None
+
+    failure_match = re.match(
+        r"TASK\s+(CLAIM|DONE|RELEASE)\s+(\S+)\s+failed:",
+        msg.content,
+    )
+    if failure_match and failure_match.group(2) == req.task_id:
+        event_action = failure_match.group(1).lower()
+        if event_action == req.action:
+            return {"status": "failed", "error": msg.content}
+
+    return None
 
 
 class DaemonHTTPHandler(BaseHTTPRequestHandler):
@@ -605,7 +674,7 @@ class Daemon:
 
     async def _request_task_action(self, action: str, task_id: str) -> dict:
         """Send TASK CLAIM/DONE and wait for server success/failure NOTICE."""
-        req = SyncRequest(task_id=task_id)
+        req = SyncRequest(task_id=task_id, action=action)
         self._task_action_request = req
 
         if action == "claim":
@@ -644,9 +713,7 @@ class Daemon:
                     continue
 
             # Response to TASK LIST request (NOTICE from server)
-            if (self._task_list_request
-                    and msg.sender in ("aircd", "server")
-                    and "TASK " in msg.content):
+            if self._task_list_request and msg.sender in ("aircd", "server"):
                 req = self._task_list_request
                 task_match = re.match(
                     r"TASK\s+(\S+)\s+channel=(\S+)\s+status=(\S+)\s+"
@@ -664,38 +731,23 @@ class Daemon:
                     if not req.done:
                         req.done = True
                         asyncio.create_task(self._finalize_sync_request(req, 0.5))
-                continue
+                    continue
+                if msg.content.startswith("No open tasks in "):
+                    if not req.done:
+                        req.done = True
+                        req.event.set()
+                    continue
 
             # Response to TASK CLAIM/DONE (NOTICE with success/failure)
-            # Server formats:
-            #   "TASK <id> claimed by <nick>: <title>"
-            #   "TASK <id> completed by <nick>: <title>"
-            #   "TASK CLAIM <id> failed: <reason>"
-            #   "TASK DONE <id> failed: <reason>"
-            if (self._task_action_request
-                    and msg.sender in ("aircd", "server")):
+            if self._task_action_request:
                 req = self._task_action_request
-                task_event = re.match(
-                    r"TASK\s+(?:CLAIM\s+|DONE\s+)?(\S+)\s+"
-                    r"(claimed by|completed by|failed)(?:\s+(\S+))?[\s:]",
-                    msg.content,
+                task_action_result = _task_action_result_from_message(
+                    msg, req, self.nick
                 )
-                if task_event and task_event.group(1) == req.task_id:
-                    action = task_event.group(2)
-                    who = task_event.group(3)  # nick for success, None for failed
-                    if action == "failed":
-                        req.responses.append({"status": "failed", "error": msg.content})
-                        req.event.set()
-                        continue
-                    # Success — only resolve if it's our own nick
-                    if who and who.rstrip(":") == self.nick:
-                        status = "claimed" if action == "claimed by" else "done"
-                        req.responses.append({"status": status, "detail": msg.content})
-                        req.event.set()
-                        continue
-                    elif who and who.rstrip(":") != self.nick:
-                        # Another agent won — our failure NOTICE is still coming
-                        pass
+                if task_action_result:
+                    req.responses.append(task_action_result)
+                    req.event.set()
+                    continue
 
             # --- Now filter self-messages for normal delivery ---
             if msg.sender == self.nick:

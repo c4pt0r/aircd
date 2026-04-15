@@ -462,18 +462,19 @@ impl Server {
         let principal = session.principal()?;
         if title.trim().is_empty() {
             session.send(format!(
-                ":{SERVER_NAME} NOTICE {} :TASK CREATE failed: title is required",
+                "{} :{SERVER_NAME} NOTICE {} :TASK CREATE failed: title is required",
+                task_failure_tags("create", "", &principal.nick, "title is required"),
                 principal.nick
             ));
             return Ok(());
         }
         let task = self.tasks.create(&channel, title.trim())?;
-        self.broadcast_system_event(
-            &channel,
-            format!(
-                "TASK {} created by {}: {}",
-                task.id, principal.nick, task.title
-            ),
+        self.broadcast_task_event(
+            &task,
+            "create",
+            "success",
+            &principal.nick,
+            format!("created by {}", principal.nick),
         )?;
         Ok(())
     }
@@ -484,13 +485,22 @@ impl Server {
             Ok(task) => task,
             Err(error) => {
                 session.send(format!(
-                    ":{SERVER_NAME} NOTICE {} :TASK CLAIM {} failed: {}",
-                    principal.nick, task_id, error
+                    "{} :{SERVER_NAME} NOTICE {} :TASK CLAIM {} failed: {}",
+                    task_failure_tags("claim", &task_id, &principal.nick, &error.to_string()),
+                    principal.nick,
+                    task_id,
+                    error
                 ));
                 return Ok(());
             }
         };
-        self.broadcast_task_event(&task, format!("claimed by {}", principal.nick))?;
+        self.broadcast_task_event(
+            &task,
+            "claim",
+            "success",
+            &principal.nick,
+            format!("claimed by {}", principal.nick),
+        )?;
         Ok(())
     }
 
@@ -500,13 +510,22 @@ impl Server {
             Ok(task) => task,
             Err(error) => {
                 session.send(format!(
-                    ":{SERVER_NAME} NOTICE {} :TASK DONE {} failed: {}",
-                    principal.nick, task_id, error
+                    "{} :{SERVER_NAME} NOTICE {} :TASK DONE {} failed: {}",
+                    task_failure_tags("done", &task_id, &principal.nick, &error.to_string()),
+                    principal.nick,
+                    task_id,
+                    error
                 ));
                 return Ok(());
             }
         };
-        self.broadcast_task_event(&task, format!("completed by {}", principal.nick))?;
+        self.broadcast_task_event(
+            &task,
+            "done",
+            "success",
+            &principal.nick,
+            format!("completed by {}", principal.nick),
+        )?;
         Ok(())
     }
 
@@ -516,13 +535,22 @@ impl Server {
             Ok(task) => task,
             Err(error) => {
                 session.send(format!(
-                    ":{SERVER_NAME} NOTICE {} :TASK RELEASE {} failed: {}",
-                    principal.nick, task_id, error
+                    "{} :{SERVER_NAME} NOTICE {} :TASK RELEASE {} failed: {}",
+                    task_failure_tags("release", &task_id, &principal.nick, &error.to_string()),
+                    principal.nick,
+                    task_id,
+                    error
                 ));
                 return Ok(());
             }
         };
-        self.broadcast_task_event(&task, format!("released by {}", principal.nick))?;
+        self.broadcast_task_event(
+            &task,
+            "release",
+            "success",
+            &principal.nick,
+            format!("released by {}", principal.nick),
+        )?;
         Ok(())
     }
 
@@ -555,19 +583,29 @@ impl Server {
         Ok(())
     }
 
-    fn broadcast_task_event(&self, task: &Task, suffix: String) -> Result<()> {
-        self.broadcast_system_event(
-            &task.channel,
-            format!("TASK {} {}: {}", task.id, suffix, task.title),
-        )
-    }
-
-    fn broadcast_system_event(&self, channel: &str, body: String) -> Result<()> {
-        let message = self.history.append(channel, SERVER_NAME, &body)?;
-        let tags = metadata_tags(message.seq, &message.msg_id, message.created_at, false);
+    fn broadcast_task_event(
+        &self,
+        task: &Task,
+        action: &str,
+        result: &str,
+        actor: &str,
+        suffix: String,
+    ) -> Result<()> {
+        let body = format!("TASK {} {}: {}", task.id, suffix, task.title);
+        let message = self.history.append(&task.channel, SERVER_NAME, &body)?;
+        let tags = task_metadata_tags(
+            message.seq,
+            &message.msg_id,
+            message.created_at,
+            false,
+            task,
+            action,
+            result,
+            actor,
+        );
         self.broadcast_message(
-            channel,
-            format!("{tags} :{SERVER_NAME} NOTICE {channel} :{body}"),
+            &task.channel,
+            format!("{tags} :{SERVER_NAME} NOTICE {} :{body}", task.channel),
             message.seq,
         )
     }
@@ -788,7 +826,10 @@ impl Session {
 
 #[cfg(test)]
 mod tests {
-    use super::{escape_tag_value, metadata_tags, Server, Session};
+    use super::{
+        escape_tag_value, metadata_tags, task_failure_tags, task_metadata_tags, Server, Session,
+        Task,
+    };
     use anyhow::Result;
     use tokio::sync::mpsc;
 
@@ -877,6 +918,40 @@ mod tests {
             "@seq=42;msg-id=msg_abc;time=1776250000;replay=1"
         );
     }
+
+    #[test]
+    fn task_metadata_tags_include_machine_readable_fields() {
+        let task = Task {
+            id: "task_1".to_string(),
+            channel: "#work".to_string(),
+            title: "fix it".to_string(),
+            status: "claimed".to_string(),
+            claimed_by: Some("agent-a".to_string()),
+            lease_expires_at: Some(123),
+        };
+
+        assert_eq!(
+            task_metadata_tags(
+                42,
+                "msg_abc",
+                1_776_250_000,
+                false,
+                &task,
+                "claim",
+                "success",
+                "agent a"
+            ),
+            "@seq=42;msg-id=msg_abc;time=1776250000;type=task;task-id=task_1;task-channel=#work;task-action=claim;task-result=success;task-status=claimed;task-actor=agent\\sa"
+        );
+    }
+
+    #[test]
+    fn task_failure_tags_escape_error_metadata() {
+        assert_eq!(
+            task_failure_tags("claim", "task_1", "agent-a", "bad; state"),
+            "@type=task;task-id=task_1;task-action=claim;task-result=error;task-actor=agent-a;task-error=bad\\:\\sstate"
+        );
+    }
 }
 
 fn normalize_channel(channel: &str) -> String {
@@ -899,6 +974,48 @@ fn metadata_tags(seq: i64, msg_id: &str, created_at: i64, replay: bool) -> Strin
     if replay {
         tags.push(("replay", "1".to_string()));
     }
+    format_message_tags(&tags)
+}
+
+fn task_metadata_tags(
+    seq: i64,
+    msg_id: &str,
+    created_at: i64,
+    replay: bool,
+    task: &Task,
+    action: &str,
+    result: &str,
+    actor: &str,
+) -> String {
+    let mut tags = vec![
+        ("seq", seq.to_string()),
+        ("msg-id", msg_id.to_string()),
+        ("time", created_at.to_string()),
+    ];
+    if replay {
+        tags.push(("replay", "1".to_string()));
+    }
+    tags.extend([
+        ("type", "task".to_string()),
+        ("task-id", task.id.clone()),
+        ("task-channel", task.channel.clone()),
+        ("task-action", action.to_string()),
+        ("task-result", result.to_string()),
+        ("task-status", task.status.clone()),
+        ("task-actor", actor.to_string()),
+    ]);
+    format_message_tags(&tags)
+}
+
+fn task_failure_tags(action: &str, task_id: &str, actor: &str, error: &str) -> String {
+    let tags = vec![
+        ("type", "task".to_string()),
+        ("task-id", task_id.to_string()),
+        ("task-action", action.to_string()),
+        ("task-result", "error".to_string()),
+        ("task-actor", actor.to_string()),
+        ("task-error", error.to_string()),
+    ];
     format_message_tags(&tags)
 }
 

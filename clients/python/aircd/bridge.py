@@ -67,6 +67,21 @@ def _format_message(msg: dict) -> str:
     return f"[{envelope}] @{sender}: {content}"
 
 
+def _format_task_action_result(result: dict, success_word: str) -> str:
+    """Format daemon task action result for Claude."""
+    if "error" in result and "status" not in result:
+        return f"Error: {result['error']}"
+
+    status = result.get("status", success_word)
+    if status == "failed":
+        return f"failed: {result.get('error', result.get('detail', 'unknown error'))}"
+    if status == "timeout":
+        return f"timeout: {result.get('error', 'no response from server')}"
+    if detail := result.get("detail"):
+        return f"{status}: {detail}"
+    return status
+
+
 @mcp.tool()
 def check_messages() -> str:
     """Check for new messages without waiting.
@@ -191,9 +206,7 @@ def claim_task(task_id: str) -> str:
         task_id: The task ID to claim (e.g. 'task_abc123').
     """
     result = _daemon_post("/tasks/claim", {"task_id": task_id})
-    if "error" in result:
-        return f"Error claiming task: {result['error']}"
-    return result.get("status", "claimed")
+    return _format_task_action_result(result, "claimed")
 
 
 @mcp.tool()
@@ -204,9 +217,7 @@ def complete_task(task_id: str) -> str:
         task_id: The task ID to complete.
     """
     result = _daemon_post("/tasks/done", {"task_id": task_id})
-    if "error" in result:
-        return f"Error completing task: {result['error']}"
-    return result.get("status", "done")
+    return _format_task_action_result(result, "done")
 
 
 def main():
