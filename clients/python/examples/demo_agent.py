@@ -37,21 +37,22 @@ async def run_agent(host: str, port: int, token: str, nick: str, channel: str) -
         logger.info("[%s] %s: %s", msg.channel, msg.sender, msg.content)
 
         # Auto-claim tasks that appear
-        match = re.search(r"TASK[_ ]CREATED?\s+(\S+)", msg.content, re.IGNORECASE)
-        if match:
-            task_id = match.group(1)
+        # Server format: "TASK <task_id> created by <nick>: <title>"
+        create_match = re.search(r"TASK\s+(task_\S+)\s+created\s+by", msg.content)
+        if create_match:
+            task_id = create_match.group(1)
             logger.info("Attempting to claim task %s", task_id)
             await client.task_claim(task_id)
 
         # Acknowledge successful claims
-        if "claimed" in msg.content.lower() and nick in msg.content:
-            logger.info("Successfully claimed a task! Working on it...")
+        # Server format: "TASK <task_id> claimed by <nick>: <title>"
+        claim_match = re.search(r"TASK\s+(task_\S+)\s+claimed\s+by\s+(\S+)", msg.content)
+        if claim_match and claim_match.group(2).rstrip(":") == nick:
+            task_id = claim_match.group(1)
+            logger.info("Successfully claimed task %s! Working on it...", task_id)
             await asyncio.sleep(2)  # simulate work
-            # Extract task ID and mark done
-            done_match = re.search(r"(\S+)\s+claimed", msg.content, re.IGNORECASE)
-            if done_match:
-                await client.task_done(done_match.group(1))
-                logger.info("Task completed")
+            await client.task_done(task_id)
+            logger.info("Task %s completed", task_id)
 
 
 def main() -> None:

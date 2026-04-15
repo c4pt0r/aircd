@@ -43,13 +43,15 @@ async def agent_racer(token: str, nick: str, task_id: str, results: dict[str, bo
     logger.info("[%s] Attempting TASK CLAIM %s", nick, task_id)
     await client.task_claim(task_id)
 
-    # Read response
+    # Read response — server sends:
+    #   Success: NOTICE #channel :TASK <id> claimed by <nick>: <title>
+    #   Failure: NOTICE <nick> :TASK CLAIM <id> failed: <reason>
     async for msg in client.messages():
         if task_id in msg.content:
-            if "claimed" in msg.content.lower() or "success" in msg.content.lower():
+            if "claimed by" in msg.content.lower():
                 results[nick] = True
                 logger.info("[%s] WON the claim!", nick)
-            else:
+            elif "fail" in msg.content.lower():
                 results[nick] = False
                 logger.info("[%s] Lost the claim: %s", nick, msg.content)
             break
@@ -70,7 +72,7 @@ async def main() -> None:
     # Extract task ID
     task_id = None
     async for msg in creator.messages():
-        match = re.search(r"TASK[_ ]CREATED?\s+(\S+)", msg.content, re.IGNORECASE)
+        match = re.search(r"TASK\s+(task_\S+)\s+created\s+by", msg.content)
         if match:
             task_id = match.group(1)
             break

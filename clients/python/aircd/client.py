@@ -128,12 +128,11 @@ class AircdClient:
             elif command in ("432", "433", "461", "462", "464"):
                 raise ConnectionError(f"Registration failed: {line}")
 
-        # Rejoin channels and request history replay (bouncer behavior)
+        # Rejoin channels that aren't yet in durable membership.
+        # Server auto-replays missed messages on reconnect (bouncer),
+        # so we only need to JOIN — no manual CHATHISTORY needed.
         for channel in list(self._state.channels):
             await self._send(f"JOIN {channel}")
-            last_seq = self._state.last_seen_seq.get(channel, 0)
-            if last_seq > 0:
-                await self._send(f"CHATHISTORY AFTER {channel} {last_seq} 1000")
 
         # Start background reader
         self._read_task = asyncio.create_task(self._reader_loop())
@@ -252,7 +251,7 @@ class AircdClient:
 
                 if command == "PING":
                     await self._send(f"PONG :{params[-1] if params else ''}")
-                elif command == "PRIVMSG" and len(params) >= 2:
+                elif command in ("PRIVMSG", "NOTICE") and len(params) >= 2:
                     sender_nick = _extract_nick(prefix)
                     # Extract seq from message tags (e.g. @seq=42)
                     seq = None
