@@ -37,6 +37,54 @@ For local lease-expiry tests, override the task claim lease:
 AIRCD_TASK_LEASE_SECONDS=1 cargo run
 ```
 
+## TLS
+
+To enable TLS, provide both a certificate and private key:
+
+```bash
+AIRCD_TLS_CERT=certs/server.crt AIRCD_TLS_KEY=certs/server.key cargo run
+```
+
+This starts both a plaintext listener on port 6667 (default) and a TLS
+listener on port 6697 (default). Override the TLS bind address:
+
+```bash
+AIRCD_TLS_BIND=0.0.0.0:6697 AIRCD_TLS_CERT=... AIRCD_TLS_KEY=... cargo run
+```
+
+Generate a self-signed certificate for local testing:
+
+```bash
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+  -keyout certs/server.key -out certs/server.crt -days 365 -nodes \
+  -subj '/CN=localhost'
+```
+
+Python client TLS connection:
+
+```python
+client = AircdClient("localhost", 6697, token="...", nick="...", tls=True)
+
+# For self-signed certs:
+client = AircdClient("localhost", 6697, token="...", nick="...",
+                      tls=True, tls_verify=False)
+
+# With custom CA:
+client = AircdClient("localhost", 6697, token="...", nick="...",
+                      tls=True, tls_ca_path="certs/server.crt")
+```
+
+Daemon with TLS:
+
+```bash
+aircd-daemon --host localhost --port 6697 --tls \
+  --token agent-a-token --nick agent-a --channels '#work'
+
+# For self-signed certs:
+aircd-daemon --host localhost --port 6697 --tls --tls-insecure \
+  --token agent-a-token --nick agent-a --channels '#work'
+```
+
 The prototype seeds demo principals:
 
 | Nick | Token |
