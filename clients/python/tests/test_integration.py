@@ -4,9 +4,9 @@ These tests require a running aircd server. Set AIRCD_HOST and AIRCD_PORT
 environment variables, or defaults to localhost:6667.
 
 The server must have these test tokens pre-configured in its principals table:
-  - token "test-token-1" -> principal with nick "agent-1"
-  - token "test-token-2" -> principal with nick "agent-2"
-  - token "test-token-3" -> principal with nick "agent-3"
+  - token "agent-a-token" -> nick "agent-a"
+  - token "agent-b-token" -> nick "agent-b"
+  - token "agent-c-token" -> nick "agent-c"
 
 Run: pytest tests/test_integration.py -v
 """
@@ -58,7 +58,7 @@ skip_no_server = pytest.mark.skipif(
 @skip_no_server
 async def test_connect_and_join():
     """Agent can connect, authenticate, and join a channel."""
-    client = await _make_client("test-token-1", "agent-1")
+    client = await _make_client("agent-a-token", "agent-a")
     try:
         await client.join("#test-basic")
         assert client._state.registered
@@ -70,21 +70,21 @@ async def test_connect_and_join():
 @skip_no_server
 async def test_two_agents_see_each_other():
     """Two agents in the same channel can exchange messages."""
-    c1 = await _make_client("test-token-1", "agent-1")
-    c2 = await _make_client("test-token-2", "agent-2")
+    c1 = await _make_client("agent-a-token", "agent-a")
+    c2 = await _make_client("agent-b-token", "agent-b")
     try:
         await c1.join("#test-chat")
         await c2.join("#test-chat")
         await asyncio.sleep(0.2)
 
-        await c1.privmsg("#test-chat", "hello from agent-1")
+        await c1.privmsg("#test-chat", "hello from agent-a")
 
         received = False
         async for msg in c2.messages():
-            if msg.sender == "agent-1" and "hello from agent-1" in msg.content:
+            if msg.sender == "agent-a" and "hello from agent-a" in msg.content:
                 received = True
                 break
-        assert received, "agent-2 did not receive message from agent-1"
+        assert received, "agent-b did not receive message from agent-a"
     finally:
         await c1.close()
         await c2.close()
@@ -93,8 +93,8 @@ async def test_two_agents_see_each_other():
 @skip_no_server
 async def test_message_has_seq():
     """Live messages should carry a seq tag from the server."""
-    c1 = await _make_client("test-token-1", "agent-1")
-    c2 = await _make_client("test-token-2", "agent-2")
+    c1 = await _make_client("agent-a-token", "agent-a")
+    c2 = await _make_client("agent-b-token", "agent-b")
     try:
         await c1.join("#test-seq")
         await c2.join("#test-seq")
@@ -123,9 +123,9 @@ async def test_concurrent_task_claim():
       Success broadcast: NOTICE #channel :TASK <id> claimed by <nick>: <title>
       Failure to caller: NOTICE <nick> :TASK CLAIM <id> failed: <reason>
     """
-    c1 = await _make_client("test-token-1", "agent-1")
-    c2 = await _make_client("test-token-2", "agent-2")
-    c3 = await _make_client("test-token-3", "agent-3")
+    c1 = await _make_client("agent-a-token", "agent-a")
+    c2 = await _make_client("agent-b-token", "agent-b")
+    c3 = await _make_client("agent-c-token", "agent-c")
     try:
         channel = "#test-claim"
         await c1.join(channel)
@@ -172,17 +172,26 @@ async def _try_claim(client: AircdClient, task_id: str) -> str | None:
     """Attempt to claim a task. Returns the agent nick if successful, None otherwise.
 
     Server responses:
-      Success: NOTICE #channel :TASK <id> claimed by <nick>: <title>
-      Failure: NOTICE <nick> :TASK CLAIM <id> failed: <reason>
+      Success broadcast: NOTICE #channel :TASK <id> claimed by <nick>: <title>
+      Failure to caller: NOTICE <nick> :TASK CLAIM <id> failed: <reason>
+
+    Since the success broadcast goes to ALL channel members, we must check
+    whether the claiming nick in the message matches our own nick.
     """
     await client.task_claim(task_id)
     async for msg in client.messages():
         if task_id not in msg.content:
             continue
         content_lower = msg.content.lower()
-        if "claimed by" in content_lower:
-            return client.nick
+        # Personal failure notice
         if "fail" in content_lower:
+            return None
+        # Broadcast success — check if WE are the claimer
+        claim_match = re.search(r"claimed\s+by\s+(\S+)", content_lower)
+        if claim_match:
+            claimer = claim_match.group(1).rstrip(":")
+            if claimer == client.nick:
+                return client.nick
             return None
     return None
 
@@ -197,8 +206,8 @@ async def test_reconnect_history_replay():
     Tests the bouncer behavior: server tracks last_seen_seq per principal,
     auto-replays missed messages on reconnect with @replay=1 tag.
     """
-    c1 = await _make_client("test-token-1", "agent-1")
-    c2 = await _make_client("test-token-2", "agent-2")
+    c1 = await _make_client("agent-a-token", "agent-a")
+    c2 = await _make_client("agent-b-token", "agent-b")
     try:
         channel = "#test-replay"
         await c1.join(channel)
@@ -213,14 +222,14 @@ async def test_reconnect_history_replay():
         await c2.close()
         await asyncio.sleep(0.3)
 
-        # Agent-1 sends messages while agent-2 is offline
+        # Agent-a sends messages while agent-b is offline
         await c1.privmsg(channel, "missed msg 1")
         await c1.privmsg(channel, "missed msg 2")
         await c1.privmsg(channel, "missed msg 3")
         await asyncio.sleep(0.3)
 
         # Agent-2 reconnects — server auto-replays missed messages
-        c2 = await _make_client("test-token-2", "agent-2")
+        c2 = await _make_client("agent-b-token", "agent-b")
         # No need to rejoin — durable membership preserved by server
         await asyncio.sleep(0.5)
 
@@ -249,8 +258,8 @@ async def test_task_lease_expiry():
     the claim succeeds even if status is 'claimed'. Default lease is 300s,
     so this test needs a short lease config or waits the full period.
     """
-    c1 = await _make_client("test-token-1", "agent-1")
-    c2 = await _make_client("test-token-2", "agent-2")
+    c1 = await _make_client("agent-a-token", "agent-a")
+    c2 = await _make_client("agent-b-token", "agent-b")
     try:
         channel = "#test-lease"
         await c1.join(channel)
@@ -263,7 +272,7 @@ async def test_task_lease_expiry():
         assert task_id
 
         result = await _try_claim(c1, task_id)
-        assert result == "agent-1", "agent-1 should claim the task"
+        assert result == "agent-a", "agent-a should claim the task"
 
         # Wait for lease to expire (server default 300s, test config should be shorter)
         # Skip this test if lease is too long for CI
@@ -271,7 +280,7 @@ async def test_task_lease_expiry():
         await asyncio.sleep(lease_wait)
 
         result2 = await _try_claim(c2, task_id)
-        assert result2 == "agent-2", "agent-2 should claim after lease expiry"
+        assert result2 == "agent-b", "agent-b should claim after lease expiry"
     finally:
         await c1.close()
         await c2.close()
