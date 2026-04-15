@@ -468,8 +468,11 @@ impl Server {
             return Ok(());
         }
         let task = self.tasks.create(&channel, title.trim())?;
-        self.broadcast_system_event(
-            &channel,
+        self.broadcast_task_event(
+            &task,
+            "create",
+            "success",
+            &principal.nick,
             format!(
                 "TASK {} created by {}: {}",
                 task.id, principal.nick, task.title
@@ -490,7 +493,16 @@ impl Server {
                 return Ok(());
             }
         };
-        self.broadcast_task_event(&task, format!("claimed by {}", principal.nick))?;
+        self.broadcast_task_event(
+            &task,
+            "claim",
+            "success",
+            &principal.nick,
+            format!(
+                "TASK {} claimed by {}: {}",
+                task.id, principal.nick, task.title
+            ),
+        )?;
         Ok(())
     }
 
@@ -506,7 +518,16 @@ impl Server {
                 return Ok(());
             }
         };
-        self.broadcast_task_event(&task, format!("completed by {}", principal.nick))?;
+        self.broadcast_task_event(
+            &task,
+            "done",
+            "success",
+            &principal.nick,
+            format!(
+                "TASK {} completed by {}: {}",
+                task.id, principal.nick, task.title
+            ),
+        )?;
         Ok(())
     }
 
@@ -522,7 +543,16 @@ impl Server {
                 return Ok(());
             }
         };
-        self.broadcast_task_event(&task, format!("released by {}", principal.nick))?;
+        self.broadcast_task_event(
+            &task,
+            "release",
+            "success",
+            &principal.nick,
+            format!(
+                "TASK {} released by {}: {}",
+                task.id, principal.nick, task.title
+            ),
+        )?;
         Ok(())
     }
 
@@ -555,19 +585,36 @@ impl Server {
         Ok(())
     }
 
-    fn broadcast_task_event(&self, task: &Task, suffix: String) -> Result<()> {
-        self.broadcast_system_event(
-            &task.channel,
-            format!("TASK {} {}: {}", task.id, suffix, task.title),
-        )
-    }
-
-    fn broadcast_system_event(&self, channel: &str, body: String) -> Result<()> {
-        let message = self.history.append(channel, SERVER_NAME, &body)?;
-        let tags = metadata_tags(message.seq, &message.msg_id, message.created_at, false);
+    fn broadcast_task_event(
+        &self,
+        task: &Task,
+        action: &str,
+        status: &str,
+        actor: &str,
+        body: String,
+    ) -> Result<()> {
+        let message = self.history.append(&task.channel, SERVER_NAME, &body)?;
+        let mut tags = vec![
+            ("seq", message.seq.to_string()),
+            ("msg-id", message.msg_id.clone()),
+            ("time", message.created_at.to_string()),
+            ("task-id", task.id.clone()),
+            ("task-action", action.to_string()),
+            ("task-status", status.to_string()),
+            ("task-actor", actor.to_string()),
+        ];
+        if !task.title.is_empty() {
+            tags.push(("task-title", task.title.clone()));
+        }
+        let tag_str = format_message_tags(
+            &tags
+                .iter()
+                .map(|(k, v)| (*k, v.clone()))
+                .collect::<Vec<_>>(),
+        );
         self.broadcast_message(
-            channel,
-            format!("{tags} :{SERVER_NAME} NOTICE {channel} :{body}"),
+            &task.channel,
+            format!("{tag_str} :{SERVER_NAME} NOTICE {} :{body}", task.channel),
             message.seq,
         )
     }

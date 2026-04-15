@@ -25,6 +25,7 @@ class Message:
     sender: str
     content: str
     raw: str  # original IRC line
+    tags: dict[str, str] = field(default_factory=dict)  # IRCv3 message tags
     is_replay: bool = False  # True if this message came from CHATHISTORY replay
 
 
@@ -289,6 +290,7 @@ class AircdClient:
                         sender=sender_nick,
                         content=params[1],
                         raw=line,
+                        tags=tags,
                         is_replay=is_replay,
                     )
                     # Track last seen seq for bouncer replay
