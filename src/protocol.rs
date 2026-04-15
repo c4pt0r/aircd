@@ -12,6 +12,10 @@ pub enum Command {
     Ping(String),
     Pong,
     Quit,
+    Cap {
+        subcommand: String,
+        capabilities: Vec<String>,
+    },
     History {
         channel: Option<String>,
         after_seq: i64,
@@ -47,6 +51,14 @@ pub fn parse_command(line: &str) -> Command {
         "PING" => Command::Ping(trailing.unwrap_or_else(|| parts.collect::<Vec<_>>().join(" "))),
         "PONG" => Command::Pong,
         "QUIT" => Command::Quit,
+        "CAP" => Command::Cap {
+            subcommand: parts.next().unwrap_or_default().to_ascii_uppercase(),
+            capabilities: trailing
+                .unwrap_or_else(|| parts.collect::<Vec<_>>().join(" "))
+                .split_whitespace()
+                .map(str::to_string)
+                .collect(),
+        },
         "CHATHISTORY" => parse_chathistory(parts.collect::<Vec<_>>()),
         "HISTORY" => Command::History {
             channel: Some(parts.next().unwrap_or_default().to_string()),
@@ -190,6 +202,17 @@ mod tests {
                 channel: Some("#demo".to_string()),
                 after_seq: 42,
                 limit: 100
+            }
+        );
+    }
+
+    #[test]
+    fn parses_cap_req() {
+        assert_eq!(
+            parse_command("CAP REQ :message-tags"),
+            Command::Cap {
+                subcommand: "REQ".to_string(),
+                capabilities: vec!["message-tags".to_string()]
             }
         );
     }

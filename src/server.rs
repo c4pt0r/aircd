@@ -13,6 +13,7 @@ use crate::store::SharedConnection;
 use crate::tasks::{Task, TaskStore};
 
 const SERVER_NAME: &str = "aircd";
+const METADATA_CAPABILITIES: &[&str] = &["message-tags"];
 
 #[derive(Clone)]
 pub struct Server {
@@ -160,6 +161,12 @@ impl Server {
                 session.send(format!(":{SERVER_NAME} PONG {SERVER_NAME} :{token}"));
             }
             Command::Pong => {}
+            Command::Cap {
+                subcommand,
+                capabilities,
+            } => {
+                self.cap(session, subcommand, capabilities)?;
+            }
             Command::Join(channel) => {
                 self.ensure_registered(session)?;
                 self.join(session, normalize_channel(&channel))?;
@@ -215,6 +222,42 @@ impl Server {
         }
 
         Ok(false)
+    }
+
+    fn cap(
+        &self,
+        session: &Session,
+        subcommand: String,
+        requested_capabilities: Vec<String>,
+    ) -> Result<()> {
+        let nick = session.nick.as_deref().unwrap_or("*");
+        let advertised = METADATA_CAPABILITIES.join(" ");
+
+        match subcommand.as_str() {
+            "LS" => {
+                session.send(format!(":{SERVER_NAME} CAP {nick} LS :{advertised}"));
+            }
+            "LIST" => {
+                session.send(format!(":{SERVER_NAME} CAP {nick} LIST :{advertised}"));
+            }
+            "REQ" => {
+                let requested = requested_capabilities.join(" ");
+                let all_supported = requested_capabilities
+                    .iter()
+                    .all(|capability| METADATA_CAPABILITIES.contains(&capability.as_str()));
+                let status = if all_supported { "ACK" } else { "NAK" };
+                session.send(format!(":{SERVER_NAME} CAP {nick} {status} :{requested}"));
+            }
+            "END" => {}
+            _ => {
+                session.send(format!(
+                    ":{SERVER_NAME} 410 {nick} {} :Invalid CAP command",
+                    subcommand
+                ));
+            }
+        }
+
+        Ok(())
     }
 
     fn try_register(&self, session: &mut Session) -> Result<()> {
@@ -348,12 +391,10 @@ impl Server {
         }
 
         let message = self.history.append(&channel, &principal.id, &body)?;
+        let tags = metadata_tags(message.seq, &message.msg_id, message.created_at, false);
         self.broadcast_message(
             &channel,
-            format!(
-                "@seq={};msg-id={};time={} :{} PRIVMSG {} :{}",
-                message.seq, message.msg_id, message.created_at, principal.nick, channel, body
-            ),
+            format!("{tags} :{} PRIVMSG {} :{}", principal.nick, channel, body),
             message.seq,
         )?;
         Ok(())
@@ -373,14 +414,10 @@ impl Server {
             for message in self.history.after(channel, after_seq, limit)? {
                 channel_max_seq = channel_max_seq.max(message.seq);
                 let sender = self.display_name(&message.sender_id)?;
+                let tags = metadata_tags(message.seq, &message.msg_id, message.created_at, true);
                 session.send(format!(
-                    "@seq={};msg-id={};time={};replay=1 :{} PRIVMSG {} :{}",
-                    message.seq,
-                    message.msg_id,
-                    message.created_at,
-                    sender,
-                    message.channel,
-                    message.body
+                    "{tags} :{} PRIVMSG {} :{}",
+                    sender, message.channel, message.body
                 ));
             }
 
@@ -498,12 +535,10 @@ impl Server {
 
     fn broadcast_system_event(&self, channel: &str, body: String) -> Result<()> {
         let message = self.history.append(channel, SERVER_NAME, &body)?;
+        let tags = metadata_tags(message.seq, &message.msg_id, message.created_at, false);
         self.broadcast_message(
             channel,
-            format!(
-                "@seq={};msg-id={};time={} :{SERVER_NAME} NOTICE {channel} :{body}",
-                message.seq, message.msg_id, message.created_at
-            ),
+            format!("{tags} :{SERVER_NAME} NOTICE {channel} :{body}"),
             message.seq,
         )
     }
@@ -724,7 +759,7 @@ impl Session {
 
 #[cfg(test)]
 mod tests {
-    use super::{Server, Session};
+    use super::{escape_tag_value, metadata_tags, Server, Session};
     use anyhow::Result;
     use tokio::sync::mpsc;
 
@@ -797,6 +832,22 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn metadata_tags_use_ircv3_escaping() {
+        assert_eq!(
+            escape_tag_value("hello world;ok\\done\r\n"),
+            "hello\\sworld\\:ok\\\\done\\r\\n"
+        );
+    }
+
+    #[test]
+    fn metadata_tags_include_replay_flag_when_requested() {
+        assert_eq!(
+            metadata_tags(42, "msg_abc", 1_776_250_000, true),
+            "@seq=42;msg-id=msg_abc;time=1776250000;replay=1"
+        );
+    }
 }
 
 fn normalize_channel(channel: &str) -> String {
@@ -808,4 +859,41 @@ fn normalize_channel(channel: &str) -> String {
     } else {
         format!("#{channel}")
     }
+}
+
+fn metadata_tags(seq: i64, msg_id: &str, created_at: i64, replay: bool) -> String {
+    let mut tags = vec![
+        ("seq", seq.to_string()),
+        ("msg-id", msg_id.to_string()),
+        ("time", created_at.to_string()),
+    ];
+    if replay {
+        tags.push(("replay", "1".to_string()));
+    }
+    format_message_tags(&tags)
+}
+
+fn format_message_tags(tags: &[(&str, String)]) -> String {
+    format!(
+        "@{}",
+        tags.iter()
+            .map(|(key, value)| format!("{key}={}", escape_tag_value(value)))
+            .collect::<Vec<_>>()
+            .join(";")
+    )
+}
+
+fn escape_tag_value(value: &str) -> String {
+    let mut escaped = String::new();
+    for character in value.chars() {
+        match character {
+            ';' => escaped.push_str("\\:"),
+            ' ' => escaped.push_str("\\s"),
+            '\\' => escaped.push_str("\\\\"),
+            '\r' => escaped.push_str("\\r"),
+            '\n' => escaped.push_str("\\n"),
+            character => escaped.push(character),
+        }
+    }
+    escaped
 }

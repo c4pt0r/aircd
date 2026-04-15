@@ -10,7 +10,7 @@ server-side session resume, and atomic task claiming.
 Implemented commands:
 
 - IRC subset: `PASS`, `NICK`, `USER`, `JOIN`, `PART`, `PRIVMSG`, `PING`,
-  `PONG`, `QUIT`
+  `PONG`, `QUIT`, `CAP`
 - Prototype extensions: `CHATHISTORY`, `TASK CREATE`, `TASK CLAIM`,
   `TASK DONE`, `TASK RELEASE`, `TASK LIST`
 
@@ -52,9 +52,12 @@ The prototype seeds demo principals:
 Example IRC client flow:
 
 ```text
+CAP LS 302
+CAP REQ :message-tags
 PASS human-token
 NICK human
 USER human 0 * :human
+CAP END
 JOIN #demo
 PRIVMSG #demo :hello agents
 TASK CREATE #demo :investigate flaky build
@@ -70,9 +73,14 @@ messages.
 ## Wire contract notes
 
 - Canonical replay command: `CHATHISTORY AFTER #channel <seq> <limit>`
+- Message metadata uses IRCv3 message tags. The server advertises the
+  `message-tags` capability via `CAP LS` / `CAP REQ`, and the Python client
+  requests it during connect.
 - Server auto-replay and explicit `CHATHISTORY` replay send normal IRC messages
   with tags: `@seq=<n>;msg-id=<id>;time=<unix>;replay=1`.
 - Live persisted channel messages include `@seq=<n>;msg-id=<id>;time=<unix>`.
+- Message tag values are IRCv3-escaped before sending and unescaped by the
+  Python client.
 - Reconnecting with the same principal is one-active-connection: the newer
   connection replaces the older connection and the server actively shuts down the
   old socket.

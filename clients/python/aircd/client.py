@@ -107,10 +107,17 @@ class AircdClient:
         self._state.writer = writer
         self._state.registered = False
 
+        # Negotiate IRCv3-style metadata tags. The server is agent-first and
+        # sends tags regardless for MVP compatibility, but CAP keeps the wire
+        # contract explicit for IRCv3-aware clients.
+        await self._send("CAP LS 302")
+        await self._send("CAP REQ :message-tags")
+
         # Authenticate: PASS -> NICK -> USER
         await self._send(f"PASS {self.token}")
         await self._send(f"NICK {self.nick}")
         await self._send(f"USER {self.nick} 0 * :aircd agent")
+        await self._send("CAP END")
 
         # Wait for registration confirmation (001 RPL_WELCOME or ERR)
         while not self._state.registered:
@@ -326,7 +333,7 @@ def _parse_irc_line(line: str) -> tuple[str, str, list[str], dict[str, str]]:
         for part in tag_str.split(";"):
             if "=" in part:
                 k, v = part.split("=", 1)
-                tags[k] = v
+                tags[k] = _unescape_tag_value(v)
             else:
                 tags[part] = ""
         line = line[tag_end + 1 :]
@@ -355,3 +362,34 @@ def _extract_nick(prefix: str) -> str:
     if "!" in prefix:
         return prefix.split("!")[0]
     return prefix
+
+
+def _unescape_tag_value(value: str) -> str:
+    """Unescape an IRCv3 message tag value."""
+    output: list[str] = []
+    index = 0
+    while index < len(value):
+        character = value[index]
+        if character != "\\":
+            output.append(character)
+            index += 1
+            continue
+
+        index += 1
+        if index >= len(value):
+            output.append("\\")
+            break
+
+        escaped = value[index]
+        output.append(
+            {
+                ":": ";",
+                "s": " ",
+                "\\": "\\",
+                "r": "\r",
+                "n": "\n",
+            }.get(escaped, escaped)
+        )
+        index += 1
+
+    return "".join(output)
