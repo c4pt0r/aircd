@@ -556,7 +556,7 @@ impl Server {
             return Ok(());
         };
 
-        {
+        let should_mark_disconnected = {
             let mut inner = self.inner.lock().expect("server mutex poisoned");
             let should_remove = inner
                 .clients
@@ -566,13 +566,16 @@ impl Server {
             if should_remove {
                 inner.clients.remove(&principal.id);
             }
-        }
+            should_remove
+        };
 
-        let db = self.db.lock().expect("sqlite mutex poisoned");
-        db.execute(
-            "UPDATE principals SET disconnected_at = ?1 WHERE id = ?2",
-            params![unix_timestamp(), principal.id],
-        )?;
+        if should_mark_disconnected {
+            let db = self.db.lock().expect("sqlite mutex poisoned");
+            db.execute(
+                "UPDATE principals SET disconnected_at = ?1 WHERE id = ?2",
+                params![unix_timestamp(), principal.id],
+            )?;
+        }
 
         Ok(())
     }
@@ -642,10 +645,15 @@ impl Server {
 
     fn add_membership(&self, principal_id: &str, channel: &str) -> Result<()> {
         let db = self.db.lock().expect("sqlite mutex poisoned");
+        let current_channel_seq: i64 = db.query_row(
+            "SELECT COALESCE(MAX(seq), 0) FROM messages WHERE channel = ?1",
+            params![channel],
+            |row| row.get(0),
+        )?;
         db.execute(
-            "INSERT OR IGNORE INTO channel_memberships (principal_id, channel, joined_at)
-             VALUES (?1, ?2, ?3)",
-            params![principal_id, channel, unix_timestamp()],
+            "INSERT OR IGNORE INTO channel_memberships (principal_id, channel, joined_at, last_seen_seq)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![principal_id, channel, unix_timestamp(), current_channel_seq],
         )?;
         Ok(())
     }
@@ -711,6 +719,83 @@ impl Session {
         self.principal
             .as_ref()
             .ok_or_else(|| anyhow!("session has no principal"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Server, Session};
+    use anyhow::Result;
+    use tokio::sync::mpsc;
+
+    fn test_server() -> Result<Server> {
+        let db = crate::store::open(":memory:")?;
+        Ok(Server::new(db))
+    }
+
+    fn test_session(token: &str, nick: &str) -> Session {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (shutdown_tx, _shutdown_rx) = mpsc::unbounded_channel();
+        Session {
+            session_id: format!("sess_{}", uuid::Uuid::new_v4().simple()),
+            principal: None,
+            nick: Some(nick.to_string()),
+            pass_token: Some(token.to_string()),
+            registered: false,
+            tx,
+            shutdown_tx,
+        }
+    }
+
+    #[test]
+    fn replaced_session_disconnect_does_not_mark_active_principal_disconnected() -> Result<()> {
+        let server = test_server()?;
+        let mut old_session = test_session("agent-a-token", "agent-a");
+        let mut new_session = test_session("agent-a-token", "agent-a");
+
+        server.try_register(&mut old_session)?;
+        server.try_register(&mut new_session)?;
+        server.disconnect(&old_session)?;
+
+        let disconnected_at: Option<i64> =
+            server.db.lock().expect("sqlite mutex poisoned").query_row(
+                "SELECT disconnected_at FROM principals WHERE id = 'agent-a'",
+                [],
+                |row| row.get(0),
+            )?;
+        assert_eq!(disconnected_at, None);
+
+        server.disconnect(&new_session)?;
+        let disconnected_at: Option<i64> =
+            server.db.lock().expect("sqlite mutex poisoned").query_row(
+                "SELECT disconnected_at FROM principals WHERE id = 'agent-a'",
+                [],
+                |row| row.get(0),
+            )?;
+        assert!(disconnected_at.is_some());
+
+        Ok(())
+    }
+
+    #[test]
+    fn new_channel_membership_starts_at_current_channel_max_seq() -> Result<()> {
+        let server = test_server()?;
+        let before_join = server
+            .history
+            .append("#existing", "agent-a", "before join")?;
+        let mut session = test_session("agent-b-token", "agent-b");
+
+        server.try_register(&mut session)?;
+        server.join(&session, "#existing".to_string())?;
+
+        let last_seen_seq: i64 = server.db.lock().expect("sqlite mutex poisoned").query_row(
+            "SELECT last_seen_seq FROM channel_memberships WHERE principal_id = 'agent-b' AND channel = '#existing'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(last_seen_seq, before_join.seq);
+
+        Ok(())
     }
 }
 
