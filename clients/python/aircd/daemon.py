@@ -67,6 +67,7 @@ class SyncRequest:
     responses: list = field(default_factory=list)
     channel: str = ""
     task_id: str = ""
+    action: str = ""  # "claim" or "done" — for task action matching
     done: bool = False
 
 
@@ -415,6 +416,7 @@ class Daemon:
         args = [
             claude_bin,
             "--dangerously-skip-permissions",
+            "--verbose",
             "--input-format", "stream-json",
             "--output-format", "stream-json",
             "--mcp-config", self._mcp_config_file.name,
@@ -450,8 +452,9 @@ class Daemon:
             proc.stdin.write((stdin_msg + "\n").encode("utf-8"))
             proc.stdin.flush()
 
-        # Start stdout reader in background
+        # Start stdout and stderr readers in background
         asyncio.create_task(self._claude_stdout_reader())
+        asyncio.create_task(self._claude_stderr_reader())
         self.agent.is_busy = True
 
         logger.info("Claude started (PID %d)", proc.pid)
@@ -509,6 +512,24 @@ class Daemon:
 
             except Exception as e:
                 logger.error("Error reading Claude stdout: %s", e)
+                break
+
+    async def _claude_stderr_reader(self):
+        """Read Claude's stderr and log it for diagnostics."""
+        proc = self.agent.process
+        if not proc or not proc.stderr:
+            return
+
+        loop = asyncio.get_event_loop()
+        while not self._shutdown:
+            try:
+                line = await loop.run_in_executor(None, proc.stderr.readline)
+                if not line:
+                    break
+                line_str = line.decode("utf-8", errors="replace").strip()
+                if line_str:
+                    logger.warning("Claude stderr: %s", line_str)
+            except Exception:
                 break
 
     async def _deliver_pending_idle(self):
@@ -605,7 +626,7 @@ class Daemon:
 
     async def _request_task_action(self, action: str, task_id: str) -> dict:
         """Send TASK CLAIM/DONE and wait for server success/failure NOTICE."""
-        req = SyncRequest(task_id=task_id)
+        req = SyncRequest(task_id=task_id, action=action)
         self._task_action_request = req
 
         if action == "claim":
@@ -666,8 +687,9 @@ class Daemon:
                         asyncio.create_task(self._finalize_sync_request(req, 0.5))
                 continue
 
-            # Response to TASK CLAIM/DONE (NOTICE with success/failure)
-            # Server formats:
+            # Response to TASK CLAIM/DONE (NOTICE with structured tags or body)
+            # Structured tags (preferred): task-id, task-action, task-status, task-actor
+            # Body fallback for older servers:
             #   "TASK <id> claimed by <nick>: <title>"
             #   "TASK <id> completed by <nick>: <title>"
             #   "TASK CLAIM <id> failed: <reason>"
@@ -675,27 +697,49 @@ class Daemon:
             if (self._task_action_request
                     and msg.sender in ("aircd", "server")):
                 req = self._task_action_request
-                task_event = re.match(
-                    r"TASK\s+(?:CLAIM\s+|DONE\s+)?(\S+)\s+"
-                    r"(claimed by|completed by|failed)(?:\s+(\S+))?[\s:]",
-                    msg.content,
-                )
-                if task_event and task_event.group(1) == req.task_id:
-                    action = task_event.group(2)
-                    who = task_event.group(3)  # nick for success, None for failed
-                    if action == "failed":
-                        req.responses.append({"status": "failed", "error": msg.content})
-                        req.event.set()
-                        continue
-                    # Success — only resolve if it's our own nick
-                    if who and who.rstrip(":") == self.nick:
-                        status = "claimed" if action == "claimed by" else "done"
-                        req.responses.append({"status": status, "detail": msg.content})
-                        req.event.set()
-                        continue
-                    elif who and who.rstrip(":") != self.nick:
-                        # Another agent won — our failure NOTICE is still coming
-                        pass
+                # Prefer structured tags if available
+                tag_task_id = msg.tags.get("task-id", "")
+                tag_action = msg.tags.get("task-action", "")
+                tag_status = msg.tags.get("task-status", "")
+                tag_actor = msg.tags.get("task-actor", "")
+                if tag_task_id and tag_action and tag_status:
+                    if tag_task_id == req.task_id and tag_action == req.action:
+                        if tag_status == "failed":
+                            req.responses.append({"status": "failed", "error": msg.content})
+                            req.event.set()
+                            continue
+                        elif tag_status == "success" and tag_actor == self.nick:
+                            status = "claimed" if tag_action == "claim" else "done"
+                            req.responses.append({"status": status, "detail": msg.content})
+                            req.event.set()
+                            continue
+                        elif tag_status == "success" and tag_actor != self.nick:
+                            pass  # Another agent's broadcast — keep waiting
+                else:
+                    # Fallback: parse body with regex
+                    fail_match = re.match(
+                        r"TASK\s+(CLAIM|DONE)\s+(\S+)\s+failed[\s:]",
+                        msg.content,
+                    )
+                    if fail_match:
+                        fail_action = "claim" if fail_match.group(1) == "CLAIM" else "done"
+                        if (fail_match.group(2) == req.task_id
+                                and fail_action == req.action):
+                            req.responses.append({"status": "failed", "error": msg.content})
+                            req.event.set()
+                            continue
+                    success_match = re.match(
+                        r"TASK\s+(\S+)\s+(claimed|completed)\s+by\s+(\S+?):",
+                        msg.content,
+                    )
+                    if success_match and success_match.group(1) == req.task_id:
+                        event_action = "claim" if success_match.group(2) == "claimed" else "done"
+                        who = success_match.group(3)
+                        if event_action == req.action and who == self.nick:
+                            status = "claimed" if event_action == "claim" else "done"
+                            req.responses.append({"status": status, "detail": msg.content})
+                            req.event.set()
+                            continue
 
             # --- Now filter self-messages for normal delivery ---
             if msg.sender == self.nick:
@@ -743,7 +787,12 @@ class Daemon:
         req.event.set()
 
     async def _outgoing_sender_loop(self):
-        """Send queued outgoing messages via IRC."""
+        """Send queued outgoing messages via IRC.
+
+        On send failure (e.g. disconnected writer during reconnect), the
+        message is re-queued at the front and we back off to let the IRC
+        client reconnect before retrying.
+        """
         while not self._shutdown:
             while self.outgoing_queue:
                 target, content = self.outgoing_queue.popleft()
@@ -751,7 +800,13 @@ class Daemon:
                     await self.irc.privmsg(target, content)
                     logger.info("Sent to %s: %s", target, content[:80])
                 except Exception as e:
-                    logger.error("Failed to send to %s: %s", target, e)
+                    logger.warning(
+                        "Send to %s failed (will retry): %s", target, e
+                    )
+                    self.outgoing_queue.appendleft((target, content))
+                    # Back off to let the IRC client reconnect
+                    await asyncio.sleep(2.0)
+                    break  # restart the outer loop
             await asyncio.sleep(0.1)
 
     async def _cleanup(self):
