@@ -441,6 +441,13 @@ class Daemon:
                 if not line:
                     logger.info("Claude process exited")
                     self.agent.is_busy = False
+                    self.agent.process = None
+                    # Auto-restart if there are pending messages
+                    with self.inbox_lock:
+                        has_pending = bool(self.agent.pending_inbox)
+                    if has_pending:
+                        logger.info("Restarting Claude to deliver pending messages")
+                        await self._start_claude()
                     break
 
                 line_str = line.decode("utf-8", errors="replace").strip()
@@ -657,6 +664,12 @@ class Daemon:
                     if len(self.agent.pending_inbox) > MAX_PENDING:
                         self.agent.pending_inbox.popleft()
                 await self._deliver_busy_notification()
+            elif self.agent.process is None:
+                # Claude exited — restart with this message
+                with self.inbox_lock:
+                    self.agent.pending_inbox.append(msg)
+                logger.info("Claude not running, restarting to deliver message")
+                await self._start_claude()
             else:
                 with self.inbox_lock:
                     self.agent.pending_inbox.append(msg)
