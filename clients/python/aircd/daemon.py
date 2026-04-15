@@ -66,6 +66,7 @@ class SyncRequest:
     event: asyncio.Event = field(default_factory=asyncio.Event)
     responses: list = field(default_factory=list)
     channel: str = ""
+    task_id: str = ""
     done: bool = False
 
 
@@ -595,7 +596,7 @@ class Daemon:
 
     async def _request_task_action(self, action: str, task_id: str) -> dict:
         """Send TASK CLAIM/DONE and wait for server success/failure NOTICE."""
-        req = SyncRequest()
+        req = SyncRequest(task_id=task_id)
         self._task_action_request = req
 
         if action == "claim":
@@ -661,11 +662,15 @@ class Daemon:
                     and msg.sender in ("aircd", "server")):
                 req = self._task_action_request
                 content_lower = msg.content.lower()
-                if "claimed by" in content_lower:
+                # Only resolve if NOTICE mentions the specific task_id we requested
+                if req.task_id and req.task_id not in msg.content:
+                    pass  # Not about our task, fall through to normal delivery
+                elif "claimed by" in content_lower:
                     req.responses.append({"status": "claimed", "detail": msg.content})
                     req.event.set()
                     continue
-                elif "done" in content_lower and "task" in content_lower:
+                elif "completed by" in content_lower or (
+                        "done" in content_lower and "task" in content_lower):
                     req.responses.append({"status": "done", "detail": msg.content})
                     req.event.set()
                     continue
