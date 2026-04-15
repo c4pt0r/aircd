@@ -135,7 +135,7 @@ messages.
 - Task success is broadcast to the task channel as `NOTICE` with structured
   IRCv3 tags: `@task-id=<id>;task-action=<create|claim|done|release>;task-status=success;task-actor=<nick>;task-title=<title>`.
 - Task failure is returned to the caller as `NOTICE <nick> :TASK ... failed`
-  (personal, no structured tags).
+  with structured IRCv3 tags: `@task-id=<id>;task-action=<action>;task-status=failed;task-actor=<nick>`.
 - `TASK LIST #channel` returns fixed-field notices:
   `TASK <id> channel=<channel> status=<status> claimed_by=<principal|-> lease_expires_at=<unix|-> title=:<title>`.
 - Task claim uses lazy lease recovery: `TASK CLAIM` can claim an open task or a
