@@ -1,0 +1,12 @@
+[project]
+name = "aircd"
+version = "0.1.0"
+description = "Python client library for aircd IRC server"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
