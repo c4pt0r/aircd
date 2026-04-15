@@ -24,6 +24,7 @@ class Message:
     sender: str
     content: str
     raw: str  # original IRC line
+    is_replay: bool = False  # True if this message came from CHATHISTORY replay
 
 
 @dataclass
@@ -116,7 +117,7 @@ class AircdClient:
             line = await self._readline()
             if line is None:
                 raise ConnectionError("Connection closed during registration")
-            _prefix, command, params = _parse_irc_line(line)
+            _prefix, command, params, _tags = _parse_irc_line(line)
             if command == "001":
                 self._state.registered = True
                 # Server may override our nick
@@ -247,18 +248,27 @@ class AircdClient:
                 if line is None:
                     raise ConnectionError("Connection lost")
 
-                prefix, command, params = _parse_irc_line(line)
+                prefix, command, params, tags = _parse_irc_line(line)
 
                 if command == "PING":
                     await self._send(f"PONG :{params[-1] if params else ''}")
                 elif command == "PRIVMSG" and len(params) >= 2:
                     sender_nick = _extract_nick(prefix)
+                    # Extract seq from message tags (e.g. @seq=42)
+                    seq = None
+                    if "seq" in tags:
+                        try:
+                            seq = int(tags["seq"])
+                        except ValueError:
+                            pass
+                    is_replay = tags.get("replay") == "1" or "batch" in tags
                     msg = Message(
-                        seq=None,
+                        seq=seq,
                         channel=params[0],
                         sender=sender_nick,
                         content=params[1],
                         raw=line,
+                        is_replay=is_replay,
                     )
                     # Track last seen seq for bouncer replay
                     if msg.seq is not None and msg.channel.startswith("#"):
@@ -299,19 +309,27 @@ class AircdClient:
 # ── IRC line parser ─────────────────────────────────────────────
 
 
-def _parse_irc_line(line: str) -> tuple[str, str, list[str]]:
-    """Parse an IRC protocol line into (prefix, command, params).
+def _parse_irc_line(line: str) -> tuple[str, str, list[str], dict[str, str]]:
+    """Parse an IRC protocol line into (prefix, command, params, tags).
 
     Returns:
-        (prefix, command, [params...])
+        (prefix, command, [params...], {tag_key: tag_value})
         prefix is empty string if not present.
+        tags is empty dict if no message tags.
     """
     prefix = ""
     trailing = ""
+    tags: dict[str, str] = {}
 
     if line.startswith("@"):
-        # Message tags — skip for now, but preserve
         tag_end = line.index(" ")
+        tag_str = line[1:tag_end]
+        for part in tag_str.split(";"):
+            if "=" in part:
+                k, v = part.split("=", 1)
+                tags[k] = v
+            else:
+                tags[part] = ""
         line = line[tag_end + 1 :]
 
     if line.startswith(":"):
@@ -330,7 +348,7 @@ def _parse_irc_line(line: str) -> tuple[str, str, list[str]]:
     if trailing:
         params.append(trailing)
 
-    return prefix, command, params
+    return prefix, command, params, tags
 
 
 def _extract_nick(prefix: str) -> str:
