@@ -668,19 +668,25 @@ class Daemon:
                 req = self._task_action_request
                 task_event = re.match(
                     r"TASK\s+(?:CLAIM\s+|DONE\s+)?(\S+)\s+"
-                    r"(claimed by|completed by|failed)[\s:]",
+                    r"(claimed by|completed by|failed)(?:\s+(\S+))?[\s:]",
                     msg.content,
                 )
                 if task_event and task_event.group(1) == req.task_id:
                     action = task_event.group(2)
-                    if action == "claimed by":
-                        req.responses.append({"status": "claimed", "detail": msg.content})
-                    elif action == "completed by":
-                        req.responses.append({"status": "done", "detail": msg.content})
-                    else:  # failed
+                    who = task_event.group(3)  # nick for success, None for failed
+                    if action == "failed":
                         req.responses.append({"status": "failed", "error": msg.content})
-                    req.event.set()
-                    continue
+                        req.event.set()
+                        continue
+                    # Success — only resolve if it's our own nick
+                    if who and who.rstrip(":") == self.nick:
+                        status = "claimed" if action == "claimed by" else "done"
+                        req.responses.append({"status": status, "detail": msg.content})
+                        req.event.set()
+                        continue
+                    elif who and who.rstrip(":") != self.nick:
+                        # Another agent won — our failure NOTICE is still coming
+                        pass
 
             # --- Now filter self-messages for normal delivery ---
             if msg.sender == self.nick:
