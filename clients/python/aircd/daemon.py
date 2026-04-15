@@ -25,6 +25,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 from argparse import ArgumentParser
 from collections import deque
 from dataclasses import dataclass, field
@@ -195,17 +196,12 @@ class DaemonHTTPHandler(BaseHTTPRequestHandler):
 
     def _handle_history(self):
         """Request CHATHISTORY from IRC server and wait for response."""
-        params = {}
-        if "?" in self.path:
-            query = self.path.split("?", 1)[1]
-            for part in query.split("&"):
-                if "=" in part:
-                    k, v = part.split("=", 1)
-                    params[k] = v
-
-        channel = params.get("channel", "")
-        after_seq = int(params.get("after_seq", "0"))
-        limit = int(params.get("limit", "50"))
+        params = urllib.parse.parse_qs(
+            urllib.parse.urlparse(self.path).query
+        )
+        channel = params.get("channel", [""])[0]
+        after_seq = int(params.get("after_seq", ["0"])[0])
+        limit = int(params.get("limit", ["50"])[0])
 
         if not channel:
             self._respond_json({"error": "channel required"}, 400)
@@ -236,15 +232,10 @@ class DaemonHTTPHandler(BaseHTTPRequestHandler):
 
     def _handle_list_tasks(self):
         """Request TASK LIST from IRC server and wait for response."""
-        params = {}
-        if "?" in self.path:
-            query = self.path.split("?", 1)[1]
-            for part in query.split("&"):
-                if "=" in part:
-                    k, v = part.split("=", 1)
-                    params[k] = v
-
-        channel = params.get("channel", "")
+        params = urllib.parse.parse_qs(
+            urllib.parse.urlparse(self.path).query
+        )
+        channel = params.get("channel", [""])[0]
         if not channel:
             self._respond_json({"error": "channel required"}, 400)
             return

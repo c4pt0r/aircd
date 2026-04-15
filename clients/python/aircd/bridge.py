@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import urllib.parse
 import urllib.request
 import urllib.error
 from mcp.server.fastmcp import FastMCP
@@ -115,9 +116,10 @@ def read_history(channel: str, limit: int = 50, after_seq: int = 0) -> str:
         limit: Maximum number of messages to return (default 50).
         after_seq: Only return messages after this sequence number (default 0 = all).
     """
-    result = _daemon_get(
-        f"/history?channel={channel}&after_seq={after_seq}&limit={limit}"
-    )
+    params = urllib.parse.urlencode({
+        "channel": channel, "after_seq": after_seq, "limit": limit,
+    })
+    result = _daemon_get(f"/history?{params}")
     if "error" in result:
         return f"Error reading history: {result['error']}"
 
@@ -162,7 +164,8 @@ def list_tasks(channel: str) -> str:
     Args:
         channel: Channel name (e.g. '#work').
     """
-    result = _daemon_get(f"/tasks?channel={channel}")
+    params = urllib.parse.urlencode({"channel": channel})
+    result = _daemon_get(f"/tasks?{params}")
     if "error" in result:
         return f"Error listing tasks: {result['error']}"
 
