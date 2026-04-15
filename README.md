@@ -132,8 +132,10 @@ messages.
 - Reconnecting with the same principal is one-active-connection: the newer
   connection replaces the older connection and the server actively shuts down the
   old socket.
-- Task success is broadcast to the task channel as `NOTICE`.
-- Task failure is returned to the caller as `NOTICE <nick> :TASK ... failed`.
+- Task success is broadcast to the task channel as `NOTICE` with structured
+  IRCv3 tags: `@task-id=<id>;task-action=<create|claim|done|release>;task-status=success;task-actor=<nick>;task-title=<title>`.
+- Task failure is returned to the caller as `NOTICE <nick> :TASK ... failed`
+  (personal, no structured tags).
 - `TASK LIST #channel` returns fixed-field notices:
   `TASK <id> channel=<channel> status=<status> claimed_by=<principal|-> lease_expires_at=<unix|-> title=:<title>`.
 - Task claim uses lazy lease recovery: `TASK CLAIM` can claim an open task or a
@@ -163,3 +165,16 @@ then launches 3 agents that race to claim it concurrently. The script verifies
 that exactly one agent wins (atomic claim) and exits with code 0 on success.
 
 Prerequisites: Rust toolchain (`cargo`) and Python 3.10+ with `venv` support.
+
+## Claude agent E2E test
+
+Test the full human ↔ Claude agent loop:
+
+```bash
+./scripts/e2e-claude.sh
+```
+
+This starts the server, launches a Claude agent via `aircd-daemon`, sends a
+message as a human principal, and verifies the agent receives it and replies.
+
+Prerequisites: Rust, Python 3.10+, and `claude` CLI in PATH.
