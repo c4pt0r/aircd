@@ -28,6 +28,15 @@ def test_parse_numeric_reply():
     assert params == ["agent-1", "Welcome to aircd"]
 
 
+def test_parse_cap_reply():
+    line = ":aircd CAP * ACK :message-tags"
+    prefix, cmd, params, tags = _parse_irc_line(line)
+    assert prefix == "aircd"
+    assert cmd == "CAP"
+    assert params == ["*", "ACK", "message-tags"]
+    assert tags == {}
+
+
 def test_parse_join():
     line = ":agent-1!agent@aircd JOIN #work"
     prefix, cmd, params, tags = _parse_irc_line(line)
@@ -65,6 +74,12 @@ def test_parse_tags_boolean_flag():
     line = "@seq=5;batch :nick!u@h PRIVMSG #ch :batched"
     prefix, cmd, params, tags = _parse_irc_line(line)
     assert tags == {"seq": "5", "batch": ""}
+
+
+def test_parse_tags_unescapes_ircv3_values():
+    line = r"@note=hello\sworld\:ok\\done :nick PRIVMSG #ch :escaped"
+    prefix, cmd, params, tags = _parse_irc_line(line)
+    assert tags == {"note": "hello world;ok\\done"}
 
 
 def test_extract_nick_full():
