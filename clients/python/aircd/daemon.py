@@ -260,8 +260,18 @@ class DaemonHTTPHandler(BaseHTTPRequestHandler):
         if not task_id:
             self._respond_json({"error": "task_id required"}, 400)
             return
-        self.daemon.task_requests.append(("claim", task_id))
-        self._respond_json({"status": "claim requested"})
+        loop = self.daemon._loop
+        if not loop:
+            self._respond_json({"error": "daemon not ready"}, 503)
+            return
+        future = asyncio.run_coroutine_threadsafe(
+            self.daemon._request_task_action("claim", task_id), loop
+        )
+        try:
+            result = future.result(timeout=IRC_REQUEST_TIMEOUT)
+            self._respond_json(result)
+        except Exception as e:
+            self._respond_json({"error": str(e)}, 500)
 
     def _handle_task_done(self):
         body = self._read_body()
@@ -269,8 +279,18 @@ class DaemonHTTPHandler(BaseHTTPRequestHandler):
         if not task_id:
             self._respond_json({"error": "task_id required"}, 400)
             return
-        self.daemon.task_requests.append(("done", task_id))
-        self._respond_json({"status": "done requested"})
+        loop = self.daemon._loop
+        if not loop:
+            self._respond_json({"error": "daemon not ready"}, 503)
+            return
+        future = asyncio.run_coroutine_threadsafe(
+            self.daemon._request_task_action("done", task_id), loop
+        )
+        try:
+            result = future.result(timeout=IRC_REQUEST_TIMEOUT)
+            self._respond_json(result)
+        except Exception as e:
+            self._respond_json({"error": str(e)}, 500)
 
 
 class Daemon:
@@ -302,11 +322,11 @@ class Daemon:
         self.agent = AgentState()
         self.inbox_lock = Lock()
         self.outgoing_queue: deque = deque()
-        self.task_requests: deque = deque()
 
-        # Sync request/response slots for history and task list
+        # Sync request/response slots for history, task list, and task actions
         self._history_request: Optional[SyncRequest] = None
         self._task_list_request: Optional[SyncRequest] = None
+        self._task_action_request: Optional[SyncRequest] = None
 
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._notification_task: Optional[asyncio.Task] = None
@@ -343,7 +363,6 @@ class Daemon:
             await asyncio.gather(
                 self._irc_reader_loop(),
                 self._outgoing_sender_loop(),
-                self._command_processor_loop(),
             )
         except asyncio.CancelledError:
             pass
@@ -575,33 +594,53 @@ class Daemon:
         self._task_list_request = None
         return req.responses
 
+    async def _request_task_action(self, action: str, task_id: str) -> dict:
+        """Send TASK CLAIM/DONE and wait for server success/failure NOTICE."""
+        req = SyncRequest()
+        self._task_action_request = req
+
+        if action == "claim":
+            await self.irc.task_claim(task_id)
+        elif action == "done":
+            await self.irc.task_done(task_id)
+
+        try:
+            await asyncio.wait_for(req.event.wait(), timeout=IRC_REQUEST_TIMEOUT)
+        except asyncio.TimeoutError:
+            self._task_action_request = None
+            return {"status": "timeout", "error": "no response from server"}
+
+        self._task_action_request = None
+        if req.responses:
+            return req.responses[0]
+        return {"status": "unknown"}
+
     async def _irc_reader_loop(self):
         """Read messages from IRC and route to Claude or sync requests."""
+        replay_timer: Optional[asyncio.Task] = None
+
         async for msg in self.irc.messages():
             if self._shutdown:
                 break
 
-            # Skip our own messages
-            if msg.sender == self.nick:
-                continue
+            # --- Sync request handlers first (before self-message filter) ---
+            # These need to see ALL messages including our own history.
 
-            # Check if this is a response to a sync history request
+            # Response to sync CHATHISTORY request
             if msg.is_replay and self._history_request:
                 req = self._history_request
                 if msg.channel == req.channel:
                     req.responses.append(message_to_dict(msg))
-                    # Schedule a short delay to collect batch, then signal done
                     if not req.done:
                         req.done = True
                         asyncio.create_task(self._finalize_sync_request(req, 0.5))
                     continue
 
-            # Check if this is a TASK LIST response (NOTICE from server)
+            # Response to TASK LIST request (NOTICE from server)
             if (self._task_list_request
                     and msg.sender in ("aircd", "server")
                     and "TASK " in msg.content):
                 req = self._task_list_request
-                # Parse task list line: TASK <id> channel=<ch> status=<s> ...
                 task_match = re.match(
                     r"TASK\s+(\S+)\s+channel=(\S+)\s+status=(\S+)\s+"
                     r"claimed_by=(\S+)\s+lease_expires_at=(\S+)\s+title=:(.*)",
@@ -620,12 +659,40 @@ class Daemon:
                         asyncio.create_task(self._finalize_sync_request(req, 0.5))
                 continue
 
-            # On initial connect, deliver replay messages as context
+            # Response to TASK CLAIM/DONE (NOTICE with success/failure)
+            if (self._task_action_request
+                    and msg.sender in ("aircd", "server")):
+                req = self._task_action_request
+                content_lower = msg.content.lower()
+                if "claimed by" in content_lower:
+                    req.responses.append({"status": "claimed", "detail": msg.content})
+                    req.event.set()
+                    continue
+                elif "done" in content_lower and "task" in content_lower:
+                    req.responses.append({"status": "done", "detail": msg.content})
+                    req.event.set()
+                    continue
+                elif "fail" in content_lower:
+                    req.responses.append({"status": "failed", "error": msg.content})
+                    req.event.set()
+                    continue
+
+            # --- Now filter self-messages for normal delivery ---
+            if msg.sender == self.nick:
+                continue
+
+            # On initial connect, collect replay messages as context
             if msg.is_replay and self._initial_connect:
                 logger.debug("Replay (initial connect): [%s] %s: %s",
                              msg.channel, msg.sender, msg.content[:80])
                 with self.inbox_lock:
                     self.agent.pending_inbox.append(msg)
+                # Schedule delivery after a short batch window
+                if replay_timer:
+                    replay_timer.cancel()
+                replay_timer = asyncio.create_task(
+                    self._deliver_initial_replay(1.0)
+                )
                 continue
 
             # Skip replay messages after initial connect (reconnect catch-up
@@ -637,7 +704,9 @@ class Daemon:
             # Mark initial connect phase as over once we see a live message
             if self._initial_connect:
                 self._initial_connect = False
-                # Deliver any collected replay messages
+                if replay_timer:
+                    replay_timer.cancel()
+                    replay_timer = None
                 with self.inbox_lock:
                     has_pending = bool(self.agent.pending_inbox)
                 if has_pending and not self.agent.is_busy:
@@ -665,7 +734,6 @@ class Daemon:
                         self.agent.pending_inbox.popleft()
                 await self._deliver_busy_notification()
             elif self.agent.process is None:
-                # Claude exited — restart with this message
                 with self.inbox_lock:
                     self.agent.pending_inbox.append(msg)
                 logger.info("Claude not running, restarting to deliver message")
@@ -674,6 +742,17 @@ class Daemon:
                 with self.inbox_lock:
                     self.agent.pending_inbox.append(msg)
                 await self._deliver_pending_idle()
+
+    async def _deliver_initial_replay(self, delay: float):
+        """After collecting initial replay messages, deliver them to Claude."""
+        await asyncio.sleep(delay)
+        if not self._initial_connect:
+            return  # Already handled by live message arrival
+        self._initial_connect = False
+        with self.inbox_lock:
+            has_pending = bool(self.agent.pending_inbox)
+        if has_pending and not self.agent.is_busy:
+            await self._deliver_pending_idle()
 
     async def _finalize_sync_request(self, req: SyncRequest, delay: float):
         """Wait a short time for more responses, then signal done."""
@@ -690,21 +769,6 @@ class Daemon:
                     logger.info("Sent to %s: %s", target, content[:80])
                 except Exception as e:
                     logger.error("Failed to send to %s: %s", target, e)
-            await asyncio.sleep(0.1)
-
-    async def _command_processor_loop(self):
-        """Process queued IRC commands (task claim/done)."""
-        while not self._shutdown:
-            while self.task_requests:
-                action, arg = self.task_requests.popleft()
-                try:
-                    if action == "claim":
-                        await self.irc.task_claim(arg)
-                    elif action == "done":
-                        await self.irc.task_done(arg)
-                except Exception as e:
-                    logger.error("Task %s failed: %s", action, e)
-
             await asyncio.sleep(0.1)
 
     async def _cleanup(self):
