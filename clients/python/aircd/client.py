@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import ssl
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
@@ -76,6 +77,9 @@ class AircdClient:
         token: str,
         nick: str,
         *,
+        tls: bool = False,
+        tls_verify: bool = True,
+        tls_ca_path: Optional[str] = None,
         auto_reconnect: bool = True,
         reconnect_delay: float = 2.0,
         max_reconnect_delay: float = 60.0,
@@ -84,6 +88,9 @@ class AircdClient:
         self.port = port
         self.token = token
         self.nick = nick
+        self.tls = tls
+        self.tls_verify = tls_verify
+        self.tls_ca_path = tls_ca_path
         self.auto_reconnect = auto_reconnect
         self.reconnect_delay = reconnect_delay
         self.max_reconnect_delay = max_reconnect_delay
@@ -102,7 +109,15 @@ class AircdClient:
         await self._do_connect()
 
     async def _do_connect(self) -> None:
-        reader, writer = await asyncio.open_connection(self.host, self.port)
+        ssl_ctx = None
+        if self.tls:
+            ssl_ctx = ssl.create_default_context(cafile=self.tls_ca_path)
+            if not self.tls_verify:
+                ssl_ctx.check_hostname = False
+                ssl_ctx.verify_mode = ssl.CERT_NONE
+        reader, writer = await asyncio.open_connection(
+            self.host, self.port, ssl=ssl_ctx,
+        )
         self._state.reader = reader
         self._state.writer = writer
         self._state.registered = False

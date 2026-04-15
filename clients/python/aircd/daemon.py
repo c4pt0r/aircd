@@ -310,6 +310,9 @@ class Daemon:
         channels: list[str],
         http_port: int = 7667,
         claude_model: str = "sonnet",
+        tls: bool = False,
+        tls_verify: bool = True,
+        tls_ca_path: Optional[str] = None,
     ):
         self.host = host
         self.port = port
@@ -318,6 +321,9 @@ class Daemon:
         self.channels = channels
         self.http_port = http_port
         self.claude_model = claude_model
+        self.tls = tls
+        self.tls_verify = tls_verify
+        self.tls_ca_path = tls_ca_path
 
         self.irc: Optional[AircdClient] = None
         self.agent = AgentState()
@@ -346,6 +352,9 @@ class Daemon:
             self.port,
             token=self.token,
             nick=self.nick,
+            tls=self.tls,
+            tls_verify=self.tls_verify,
+            tls_ca_path=self.tls_ca_path,
             auto_reconnect=True,
         )
         await self.irc.connect()
@@ -786,6 +795,21 @@ def main():
         help="Claude model to use (default: sonnet)",
     )
     parser.add_argument(
+        "--tls",
+        action="store_true",
+        help="Connect to server using TLS",
+    )
+    parser.add_argument(
+        "--tls-insecure",
+        action="store_true",
+        help="Disable TLS certificate verification (for self-signed certs)",
+    )
+    parser.add_argument(
+        "--tls-ca",
+        default=None,
+        help="Path to CA certificate file for TLS verification",
+    )
+    parser.add_argument(
         "--verbose", "-v",
         action="store_true",
         help="Enable verbose logging",
@@ -808,6 +832,9 @@ def main():
         channels=channels,
         http_port=args.http_port,
         claude_model=args.model,
+        tls=args.tls,
+        tls_verify=not args.tls_insecure,
+        tls_ca_path=args.tls_ca,
     )
 
     loop = asyncio.new_event_loop()

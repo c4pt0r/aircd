@@ -2,9 +2,10 @@ use anyhow::{anyhow, Context, Result};
 use rusqlite::params;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::net::TcpListener;
 use tokio::sync::mpsc::{self, UnboundedSender};
+use tokio_rustls::TlsAcceptor;
 
 use crate::auth::{AuthStore, Principal};
 use crate::history::{unix_timestamp, HistoryStore};
@@ -87,8 +88,36 @@ impl Server {
         }
     }
 
-    async fn handle_stream(&self, stream: TcpStream) -> Result<()> {
-        let (reader, mut writer) = stream.into_split();
+    pub async fn listen_tls(self, bind_addr: &str, acceptor: TlsAcceptor) -> Result<()> {
+        let listener = TcpListener::bind(bind_addr)
+            .await
+            .with_context(|| format!("bind {bind_addr}"))?;
+        println!("aircd listening on {bind_addr} (TLS)");
+
+        loop {
+            let (stream, peer_addr) = listener.accept().await?;
+            let acceptor = acceptor.clone();
+            let server = self.clone();
+            tokio::spawn(async move {
+                let tls_stream = match acceptor.accept(stream).await {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        eprintln!("TLS handshake failed from {peer_addr}: {error:#}");
+                        return;
+                    }
+                };
+                if let Err(error) = server.handle_stream(tls_stream).await {
+                    eprintln!("connection {peer_addr} closed: {error:#}");
+                }
+            });
+        }
+    }
+
+    async fn handle_stream<S>(&self, stream: S) -> Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let (reader, mut writer) = tokio::io::split(stream);
         let mut lines = BufReader::new(reader).lines();
         let (tx, mut rx) = mpsc::unbounded_channel::<String>();
         let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel::<String>();
