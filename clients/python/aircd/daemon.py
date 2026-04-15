@@ -658,24 +658,27 @@ class Daemon:
                 continue
 
             # Response to TASK CLAIM/DONE (NOTICE with success/failure)
+            # Server formats:
+            #   "TASK <id> claimed by <nick>: <title>"
+            #   "TASK <id> completed by <nick>: <title>"
+            #   "TASK CLAIM <id> failed: <reason>"
+            #   "TASK DONE <id> failed: <reason>"
             if (self._task_action_request
                     and msg.sender in ("aircd", "server")):
                 req = self._task_action_request
-                content_lower = msg.content.lower()
-                # Only resolve if NOTICE mentions the specific task_id we requested
-                if req.task_id and req.task_id not in msg.content:
-                    pass  # Not about our task, fall through to normal delivery
-                elif "claimed by" in content_lower:
-                    req.responses.append({"status": "claimed", "detail": msg.content})
-                    req.event.set()
-                    continue
-                elif "completed by" in content_lower or (
-                        "done" in content_lower and "task" in content_lower):
-                    req.responses.append({"status": "done", "detail": msg.content})
-                    req.event.set()
-                    continue
-                elif "fail" in content_lower:
-                    req.responses.append({"status": "failed", "error": msg.content})
+                task_event = re.match(
+                    r"TASK\s+(?:CLAIM\s+|DONE\s+)?(\S+)\s+"
+                    r"(claimed by|completed by|failed)[\s:]",
+                    msg.content,
+                )
+                if task_event and task_event.group(1) == req.task_id:
+                    action = task_event.group(2)
+                    if action == "claimed by":
+                        req.responses.append({"status": "claimed", "detail": msg.content})
+                    elif action == "completed by":
+                        req.responses.append({"status": "done", "detail": msg.content})
+                    else:  # failed
+                        req.responses.append({"status": "failed", "error": msg.content})
                     req.event.set()
                     continue
 
