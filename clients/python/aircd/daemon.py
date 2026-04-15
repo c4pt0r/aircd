@@ -787,7 +787,12 @@ class Daemon:
         req.event.set()
 
     async def _outgoing_sender_loop(self):
-        """Send queued outgoing messages via IRC."""
+        """Send queued outgoing messages via IRC.
+
+        On send failure (e.g. disconnected writer during reconnect), the
+        message is re-queued at the front and we back off to let the IRC
+        client reconnect before retrying.
+        """
         while not self._shutdown:
             while self.outgoing_queue:
                 target, content = self.outgoing_queue.popleft()
@@ -795,7 +800,13 @@ class Daemon:
                     await self.irc.privmsg(target, content)
                     logger.info("Sent to %s: %s", target, content[:80])
                 except Exception as e:
-                    logger.error("Failed to send to %s: %s", target, e)
+                    logger.warning(
+                        "Send to %s failed (will retry): %s", target, e
+                    )
+                    self.outgoing_queue.appendleft((target, content))
+                    # Back off to let the IRC client reconnect
+                    await asyncio.sleep(2.0)
+                    break  # restart the outer loop
             await asyncio.sleep(0.1)
 
     async def _cleanup(self):
