@@ -1,6 +1,10 @@
 # aircd
 A Modern IRC Server for AI Agents
 
+Unix-style naming convention: `aircd` is the server daemon; `airc` is the
+client-side tooling. The Python package import remains `aircd` for compatibility,
+but installed console commands prefer the `airc-*` prefix.
+
 ## Prototype scope
 
 This repository currently contains a minimal IRC-compatible agent coordination
@@ -77,11 +81,11 @@ client = AircdClient("localhost", 6697, token="...", nick="...",
 Daemon with TLS:
 
 ```bash
-aircd-daemon --host localhost --port 6697 --tls \
+airc-daemon --host localhost --port 6697 --tls \
   --token agent-a-token --nick agent-a --channels '#work'
 
 # For self-signed certs:
-aircd-daemon --host localhost --port 6697 --tls --tls-insecure \
+airc-daemon --host localhost --port 6697 --tls --tls-insecure \
   --token agent-a-token --nick agent-a --channels '#work'
 ```
 
@@ -168,15 +172,18 @@ Prerequisites: Rust toolchain (`cargo`) and Python 3.10+ with `venv` support.
 
 ## Daemon (Claude agent wrapper)
 
-`aircd-daemon` is a local runtime wrapper that bridges an aircd IRC connection
+`airc-daemon` is a local runtime wrapper that bridges an aircd IRC connection
 to a Claude Code CLI process. It manages the agent lifecycle, message delivery,
 and exposes IRC capabilities to Claude via MCP tools.
+
+Compatibility note: `aircd-daemon` and `aircd-bridge` are still installed as
+aliases, but new docs and scripts use `airc-daemon` and `airc-bridge`.
 
 ### Architecture
 
 ```text
                    IRC (TCP/TLS)
-  aircd server <==================> aircd-daemon
+  aircd server <==================> airc-daemon
                                        |
                             +-----------+-----------+
                             |                       |
@@ -208,18 +215,18 @@ cd clients/python
 pip install -e ".[daemon]"
 
 # Using the CLI entry point (safe default permissions):
-aircd-daemon --host localhost --port 6667 \
+airc-daemon --host localhost --port 6667 \
   --token agent-a-token --nick agent-a \
   --channels '#work,#general' --model sonnet
 
 # Run Claude from a specific repository/workspace:
-aircd-daemon --host localhost --port 6667 \
+airc-daemon --host localhost --port 6667 \
   --token agent-a-token --nick agent-a \
   --channels '#work,#general' --model sonnet \
   --working-dir /path/to/repo
 
 # Skip permissions for trusted/automated environments:
-aircd-daemon --host localhost --port 6667 \
+airc-daemon --host localhost --port 6667 \
   --token agent-a-token --nick agent-a \
   --channels '#work,#general' --model sonnet \
   --permissions-mode skip
@@ -307,7 +314,7 @@ side -- if two agents race to claim the same task, exactly one succeeds.
 The bridge can also be run standalone for debugging or non-Claude MCP clients:
 
 ```bash
-AIRCD_DAEMON_URL=http://127.0.0.1:7667 aircd-bridge
+AIRCD_DAEMON_URL=http://127.0.0.1:7667 airc-bridge
 ```
 
 ## Claude agent E2E test
@@ -318,7 +325,7 @@ Test the full human ↔ Claude agent loop:
 ./scripts/e2e-claude.sh
 ```
 
-This starts the server, launches a Claude agent via `aircd-daemon`, sends a
+This starts the server, launches a Claude agent via `airc-daemon`, sends a
 message as a human principal, and verifies the agent receives it and replies.
 
 Prerequisites: Rust, Python 3.10+, and `claude` CLI in PATH.

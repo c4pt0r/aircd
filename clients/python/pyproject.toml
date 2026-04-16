@@ -10,6 +10,8 @@ daemon = ["mcp>=1.0"]
 dev = ["pytest", "pytest-asyncio"]
 
 [project.scripts]
+airc-daemon = "aircd.daemon:main"
+airc-bridge = "aircd.bridge:main"
 aircd-daemon = "aircd.daemon:main"
 aircd-bridge = "aircd.bridge:main"
 
