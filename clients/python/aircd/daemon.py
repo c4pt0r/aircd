@@ -55,6 +55,9 @@ TURN_WATCHDOG_INTERVAL = 30.0
 # Maximum dedup entries before oldest are evicted (LRU bounded)
 MAX_DEDUP_ENTRIES = 10000
 
+# How long delivered messages stay in-flight before becoming visible again (seconds)
+MESSAGE_VISIBILITY_TIMEOUT = 30.0
+
 
 @dataclass
 class AgentState:
@@ -64,6 +67,7 @@ class AgentState:
     session_id: Optional[str] = None
     is_busy: bool = False
     pending_inbox: deque = field(default_factory=deque)
+    in_flight: dict = field(default_factory=dict)  # msg_id -> (Message, delivered_at)
     last_notification_time: float = 0.0
     seen_msg_ids: OrderedDict = field(default_factory=OrderedDict)
     last_stdout_activity: float = 0.0  # monotonic time of last stdout event
@@ -179,6 +183,8 @@ class DaemonHTTPHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path == "/messages/send":
             self._handle_send_message()
+        elif self.path == "/messages/ack":
+            self._handle_ack_messages()
         elif self.path == "/tasks/claim":
             self._handle_task_claim()
         elif self.path == "/tasks/done":
@@ -187,13 +193,49 @@ class DaemonHTTPHandler(BaseHTTPRequestHandler):
             self._respond_json({"error": "not found"}, 404)
 
     def _handle_check_messages(self):
-        """Drain pending delivery buffer and return messages."""
+        """Return pending messages with visibility-timeout semantics.
+
+        Messages are moved to an in-flight buffer. If not ACKed within
+        MESSAGE_VISIBILITY_TIMEOUT, they become visible again. This gives
+        at-least-once delivery between daemon and Claude.
+        """
+        now = time.time()
         messages = []
         with self.daemon.inbox_lock:
+            # Re-queue expired in-flight messages
+            expired = [
+                (mid, msg)
+                for mid, (msg, delivered_at) in self.daemon.agent.in_flight.items()
+                if now - delivered_at > MESSAGE_VISIBILITY_TIMEOUT
+            ]
+            for mid, msg in expired:
+                del self.daemon.agent.in_flight[mid]
+                self.daemon.agent.pending_inbox.appendleft(msg)
+                logger.warning("Re-queued unacked message %s", mid)
+
+            # Deliver pending messages → in-flight
             while self.daemon.agent.pending_inbox:
                 msg = self.daemon.agent.pending_inbox.popleft()
-                messages.append(message_to_dict(msg))
+                msg_dict = message_to_dict(msg)
+                mid = msg_dict.get("msg_id") or f"noid_{id(msg)}"
+                self.daemon.agent.in_flight[mid] = (msg, now)
+                messages.append(msg_dict)
         self._respond_json({"messages": messages})
+
+    def _handle_ack_messages(self):
+        """Acknowledge receipt of messages, removing them from in-flight."""
+        body = self._read_body()
+        msg_ids = body.get("msg_ids", [])
+        if not msg_ids:
+            self._respond_json({"error": "msg_ids required"}, 400)
+            return
+        acked = 0
+        with self.daemon.inbox_lock:
+            for mid in msg_ids:
+                if mid in self.daemon.agent.in_flight:
+                    del self.daemon.agent.in_flight[mid]
+                    acked += 1
+        self._respond_json({"acked": acked})
 
     def _handle_send_message(self):
         """Queue a PRIVMSG to be sent via IRC."""
@@ -341,10 +383,10 @@ class Daemon:
         self.inbox_lock = Lock()
         self.outgoing_queue: deque = deque()
 
-        # Sync request/response slots for history, task list, and task actions
-        self._history_request: Optional[SyncRequest] = None
-        self._task_list_request: Optional[SyncRequest] = None
-        self._task_action_request: Optional[SyncRequest] = None
+        # Sync request/response maps keyed by correlation ID
+        self._history_requests: dict[str, SyncRequest] = {}
+        self._task_list_requests: dict[str, SyncRequest] = {}
+        self._task_action_requests: dict[str, SyncRequest] = {}
 
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._notification_task: Optional[asyncio.Task] = None
@@ -650,25 +692,25 @@ class Daemon:
 
     async def _request_history(self, channel: str, after_seq: int, limit: int) -> list:
         """Send CHATHISTORY and collect replay responses synchronously."""
+        key = channel
         req = SyncRequest(channel=channel)
-        self._history_request = req
+        self._history_requests[key] = req
 
         await self.irc.history(channel, after_seq, limit)
 
-        # Wait for responses with timeout — the reader loop will collect
-        # replay-tagged messages and signal when done
         try:
             await asyncio.wait_for(req.event.wait(), timeout=IRC_REQUEST_TIMEOUT)
         except asyncio.TimeoutError:
             pass
 
-        self._history_request = None
+        self._history_requests.pop(key, None)
         return req.responses
 
     async def _request_task_list(self, channel: str) -> list:
         """Send TASK LIST and collect response NOTICEs synchronously."""
+        key = channel
         req = SyncRequest(channel=channel)
-        self._task_list_request = req
+        self._task_list_requests[key] = req
 
         await self.irc.task_list(channel)
 
@@ -677,13 +719,14 @@ class Daemon:
         except asyncio.TimeoutError:
             pass
 
-        self._task_list_request = None
+        self._task_list_requests.pop(key, None)
         return req.responses
 
     async def _request_task_action(self, action: str, task_id: str) -> dict:
         """Send TASK CLAIM/DONE and wait for server success/failure NOTICE."""
+        key = f"{action}:{task_id}"
         req = SyncRequest(task_id=task_id, action=action)
-        self._task_action_request = req
+        self._task_action_requests[key] = req
 
         if action == "claim":
             await self.irc.task_claim(task_id)
@@ -693,10 +736,10 @@ class Daemon:
         try:
             await asyncio.wait_for(req.event.wait(), timeout=IRC_REQUEST_TIMEOUT)
         except asyncio.TimeoutError:
-            self._task_action_request = None
+            self._task_action_requests.pop(key, None)
             return {"status": "timeout", "error": "no response from server"}
 
-        self._task_action_request = None
+        self._task_action_requests.pop(key, None)
         if req.responses:
             return req.responses[0]
         return {"status": "unknown"}
@@ -711,55 +754,51 @@ class Daemon:
             # These need to see ALL messages including our own history.
 
             # Response to sync CHATHISTORY request
-            if msg.is_replay and self._history_request:
-                req = self._history_request
-                if msg.channel == req.channel:
-                    req.responses.append(message_to_dict(msg))
-                    if not req.done:
-                        req.done = True
-                        asyncio.create_task(self._finalize_sync_request(req, 0.5))
-                    continue
+            if msg.is_replay and msg.channel in self._history_requests:
+                req = self._history_requests[msg.channel]
+                req.responses.append(message_to_dict(msg))
+                if not req.done:
+                    req.done = True
+                    asyncio.create_task(self._finalize_sync_request(req, 0.5))
+                continue
 
             # Response to TASK LIST request (NOTICE from server)
-            if (self._task_list_request
+            if (self._task_list_requests
                     and msg.sender in ("aircd", "server")
                     and "TASK " in msg.content):
-                req = self._task_list_request
                 task_match = re.match(
                     r"TASK\s+(\S+)\s+channel=(\S+)\s+status=(\S+)\s+"
                     r"claimed_by=(\S+)\s+lease_expires_at=(\S+)\s+title=:(.*)",
                     msg.content,
                 )
                 if task_match:
-                    req.responses.append({
-                        "id": task_match.group(1),
-                        "channel": task_match.group(2),
-                        "status": task_match.group(3),
-                        "claimed_by": task_match.group(4),
-                        "title": task_match.group(6),
-                    })
-                    if not req.done:
-                        req.done = True
-                        asyncio.create_task(self._finalize_sync_request(req, 0.5))
+                    task_channel = task_match.group(2)
+                    req = self._task_list_requests.get(task_channel)
+                    if req:
+                        req.responses.append({
+                            "id": task_match.group(1),
+                            "channel": task_channel,
+                            "status": task_match.group(3),
+                            "claimed_by": task_match.group(4),
+                            "title": task_match.group(6),
+                        })
+                        if not req.done:
+                            req.done = True
+                            asyncio.create_task(self._finalize_sync_request(req, 0.5))
                 continue
 
             # Response to TASK CLAIM/DONE (NOTICE with structured tags or body)
-            # Structured tags (preferred): task-id, task-action, task-status, task-actor
-            # Body fallback for older servers:
-            #   "TASK <id> claimed by <nick>: <title>"
-            #   "TASK <id> completed by <nick>: <title>"
-            #   "TASK CLAIM <id> failed: <reason>"
-            #   "TASK DONE <id> failed: <reason>"
-            if (self._task_action_request
+            if (self._task_action_requests
                     and msg.sender in ("aircd", "server")):
-                req = self._task_action_request
                 # Prefer structured tags if available
                 tag_task_id = msg.tags.get("task-id", "")
                 tag_action = msg.tags.get("task-action", "")
                 tag_status = msg.tags.get("task-status", "")
                 tag_actor = msg.tags.get("task-actor", "")
                 if tag_task_id and tag_action and tag_status:
-                    if tag_task_id == req.task_id and tag_action == req.action:
+                    key = f"{tag_action}:{tag_task_id}"
+                    req = self._task_action_requests.get(key)
+                    if req:
                         if tag_status == "failed":
                             req.responses.append({"status": "failed", "error": msg.content})
                             req.event.set()
@@ -779,8 +818,9 @@ class Daemon:
                     )
                     if fail_match:
                         fail_action = "claim" if fail_match.group(1) == "CLAIM" else "done"
-                        if (fail_match.group(2) == req.task_id
-                                and fail_action == req.action):
+                        key = f"{fail_action}:{fail_match.group(2)}"
+                        req = self._task_action_requests.get(key)
+                        if req:
                             req.responses.append({"status": "failed", "error": msg.content})
                             req.event.set()
                             continue
@@ -788,10 +828,12 @@ class Daemon:
                         r"TASK\s+(\S+)\s+(claimed|completed)\s+by\s+(\S+?):",
                         msg.content,
                     )
-                    if success_match and success_match.group(1) == req.task_id:
+                    if success_match:
                         event_action = "claim" if success_match.group(2) == "claimed" else "done"
                         who = success_match.group(3)
-                        if event_action == req.action and who == self.nick:
+                        key = f"{event_action}:{success_match.group(1)}"
+                        req = self._task_action_requests.get(key)
+                        if req and who == self.nick:
                             status = "claimed" if event_action == "claim" else "done"
                             req.responses.append({"status": status, "detail": msg.content})
                             req.event.set()

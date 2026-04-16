@@ -72,9 +72,12 @@ def check_messages() -> str:
     """Check for new messages without waiting.
 
     Returns immediately with any pending messages from IRC channels,
-    or 'No new messages' if none. Use this freely during work — at
-    natural breakpoints, after notifications, or whenever you want
-    to see if anything new came in.
+    or 'No new messages' if none. Messages are held in-flight until
+    acknowledged. Call ack_messages with the returned msg_ids after
+    processing, or they will be re-delivered after a timeout.
+
+    Use this freely during work — at natural breakpoints, after
+    notifications, or whenever you want to see if anything new came in.
     """
     result = _daemon_get("/messages/pending")
     if "error" in result:
@@ -84,8 +87,35 @@ def check_messages() -> str:
     if not messages:
         return "No new messages."
 
+    # Auto-ack: collect msg_ids and ack immediately after successful fetch.
+    # This provides at-least-once semantics — if the bridge crashes between
+    # fetch and ack, messages will be re-delivered after visibility timeout.
+    msg_ids = [m.get("msg_id", "") for m in messages if m.get("msg_id")]
+    if msg_ids:
+        _daemon_post("/messages/ack", {"msg_ids": msg_ids})
+
     lines = [_format_message(m) for m in messages]
     return "\n".join(lines)
+
+
+@mcp.tool()
+def ack_messages(msg_ids: list[str]) -> str:
+    """Acknowledge receipt of messages by their IDs.
+
+    Messages returned by check_messages are held in-flight. If not
+    acknowledged within the visibility timeout (~30s), they become
+    available again. This tool explicitly acknowledges messages.
+
+    Note: check_messages auto-acks on success, so this is only needed
+    if you want manual control over acknowledgement.
+
+    Args:
+        msg_ids: List of message IDs to acknowledge.
+    """
+    result = _daemon_post("/messages/ack", {"msg_ids": msg_ids})
+    if "error" in result:
+        return f"Error acknowledging messages: {result['error']}"
+    return f"Acknowledged {result.get('acked', 0)} message(s)."
 
 
 @mcp.tool()
