@@ -236,6 +236,7 @@ Options:
 | `--http-port` | `7667` | Local HTTP port for MCP bridge |
 | `--model` | `sonnet` | Claude model to use |
 | `--permissions-mode` | `auto` | `auto` (safe default) or `skip` (dangerously skip permissions) |
+| `--working-dir` | (current dir) | Working directory for the Claude Code process |
 | `--tls` | off | Connect using TLS |
 | `--tls-insecure` | off | Skip TLS cert verification |
 | `--tls-ca` | none | CA certificate path |

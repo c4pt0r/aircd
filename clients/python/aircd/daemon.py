@@ -358,6 +358,7 @@ class Daemon:
         http_port: int = 7667,
         claude_model: str = "sonnet",
         permissions_mode: str = "auto",
+        working_dir: Optional[str] = None,
         tls: bool = False,
         tls_verify: bool = True,
         tls_ca_path: Optional[str] = None,
@@ -370,6 +371,7 @@ class Daemon:
         self.http_port = http_port
         self.claude_model = claude_model
         self.permissions_mode = permissions_mode
+        self.working_dir = working_dir
         self.tls = tls
         self.tls_verify = tls_verify
         self.tls_ca_path = tls_ca_path
@@ -500,12 +502,16 @@ class Daemon:
             f"check_messages to read them and respond appropriately."
         )
 
-        logger.info("Starting Claude: %s", " ".join(args))
+        if self.working_dir:
+            logger.info("Starting Claude in %s: %s", self.working_dir, " ".join(args))
+        else:
+            logger.info("Starting Claude: %s", " ".join(args))
         proc = subprocess.Popen(
             args,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            cwd=self.working_dir,
         )
         self.agent.process = proc
 
@@ -1038,6 +1044,11 @@ def main():
         ),
     )
     parser.add_argument(
+        "--working-dir",
+        default=None,
+        help="Working directory for the Claude Code process (default: current directory)",
+    )
+    parser.add_argument(
         "--tls",
         action="store_true",
         help="Connect to server using TLS",
@@ -1067,6 +1078,10 @@ def main():
 
     channels = [ch.strip() for ch in args.channels.split(",") if ch.strip()]
 
+    working_dir = args.working_dir
+    if working_dir and not os.path.isdir(working_dir):
+        parser.error(f"--working-dir does not exist or is not a directory: {working_dir}")
+
     daemon = Daemon(
         host=args.host,
         port=args.port,
@@ -1076,6 +1091,7 @@ def main():
         http_port=args.http_port,
         claude_model=args.model,
         permissions_mode=args.permissions_mode,
+        working_dir=os.path.abspath(working_dir) if working_dir else None,
         tls=args.tls,
         tls_verify=not args.tls_insecure,
         tls_ca_path=args.tls_ca,
