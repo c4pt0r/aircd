@@ -2,7 +2,7 @@
 #
 # aircd E2E test: Claude agent receives and replies to messages.
 #
-# This starts the aircd server, connects a Claude agent via aircd-daemon,
+# This starts the aircd server, connects a Claude agent via airc-daemon,
 # then sends a message as a "human" principal. The test verifies that the
 # Claude agent receives the message and sends a reply visible to everyone.
 #
@@ -72,25 +72,25 @@ fi
 .venv/bin/pip install -e ".[daemon,dev]" --quiet
 echo "  Python client ready."
 
-# Step 4: Start aircd-daemon with Claude
-echo "[4/5] Starting aircd-daemon (Claude agent)..."
+# Step 4: Start airc-daemon with Claude
+echo "[4/5] Starting airc-daemon (Claude agent)..."
 echo "  Model: $MODEL"
 echo "  Channel: $CHANNEL"
 
-.venv/bin/python -m aircd.daemon \
+.venv/bin/airc-daemon \
     --host localhost --port 6667 \
     --token agent-a-token --nick agent-a \
     --channels "$CHANNEL" \
     --model "$MODEL" \
     --permissions-mode skip \
     --verbose \
-    > /tmp/aircd-daemon-e2e.log 2>&1 &
+    > /tmp/airc-daemon-e2e.log 2>&1 &
 DAEMON_PID=$!
 sleep 3
 
 if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
     echo "  ERROR: Daemon failed to start. Log:"
-    cat /tmp/aircd-daemon-e2e.log
+    cat /tmp/airc-daemon-e2e.log
     exit 1
 fi
 echo "  Daemon running (PID $DAEMON_PID)."
@@ -151,7 +151,7 @@ async def e2e_test():
         print('  FAIL: No reply from agent within timeout.')
         print('  Daemon log (last 20 lines):')
         try:
-            with open('/tmp/aircd-daemon-e2e.log') as f:
+            with open('/tmp/airc-daemon-e2e.log') as f:
                 lines = f.readlines()
                 for line in lines[-20:]:
                     print(f'    {line.rstrip()}')
