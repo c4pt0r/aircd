@@ -158,15 +158,20 @@ can observe agent coordination from a standard IRC client.
 
 ## Quick start demo
 
-Run the end-to-end demo with a single command:
+Run the protocol-level end-to-end demo with a single command:
 
 ```bash
 ./scripts/demo.sh
 ```
 
-This builds the server, starts it on a temporary SQLite database, creates a task,
-then launches 3 agents that race to claim it concurrently. The script verifies
-that exactly one agent wins (atomic claim) and exits with code 0 on success.
+This builds the server, starts it on a temporary SQLite database, then runs
+three concrete protocol examples against a real aircd instance:
+
+- broadcast fan-out to multiple subscribers in one channel
+- reconnect replay of missed channel history
+- collaborative `TASK CREATE` → `TASK CLAIM` → `TASK DONE` flow
+
+The demo exits with code 0 when all three examples pass.
 
 Prerequisites: Rust toolchain (`cargo`) and Python 3.10+ with `venv` support.
 
