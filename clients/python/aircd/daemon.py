@@ -202,16 +202,7 @@ class DaemonHTTPHandler(BaseHTTPRequestHandler):
         now = time.time()
         messages = []
         with self.daemon.inbox_lock:
-            # Re-queue expired in-flight messages
-            expired = [
-                (mid, msg)
-                for mid, (msg, delivered_at) in self.daemon.agent.in_flight.items()
-                if now - delivered_at > MESSAGE_VISIBILITY_TIMEOUT
-            ]
-            for mid, msg in expired:
-                del self.daemon.agent.in_flight[mid]
-                self.daemon.agent.pending_inbox.appendleft(msg)
-                logger.warning("Re-queued unacked message %s", mid)
+            self.daemon._requeue_expired_in_flight_locked(now, "check_messages")
 
             # Deliver pending messages → in-flight
             while self.daemon.agent.pending_inbox:
@@ -918,6 +909,22 @@ class Daemon:
                     break  # restart the outer loop
             await asyncio.sleep(0.1)
 
+    def _requeue_expired_in_flight_locked(self, now: float, source: str) -> int:
+        """Move expired in-flight messages back to pending.
+
+        Caller must hold inbox_lock.
+        """
+        expired = [
+            (mid, msg)
+            for mid, (msg, delivered_at) in self.agent.in_flight.items()
+            if now - delivered_at > MESSAGE_VISIBILITY_TIMEOUT
+        ]
+        for mid, msg in expired:
+            del self.agent.in_flight[mid]
+            self.agent.pending_inbox.appendleft(msg)
+            logger.warning("%s: re-queued unacked message %s", source, mid)
+        return len(expired)
+
     async def _in_flight_reaper(self):
         """Periodically reap expired in-flight messages back to pending.
 
@@ -928,15 +935,21 @@ class Daemon:
             await asyncio.sleep(MESSAGE_VISIBILITY_TIMEOUT / 2)
             now = time.time()
             with self.inbox_lock:
-                expired = [
-                    (mid, msg)
-                    for mid, (msg, delivered_at) in self.agent.in_flight.items()
-                    if now - delivered_at > MESSAGE_VISIBILITY_TIMEOUT
-                ]
-                for mid, msg in expired:
-                    del self.agent.in_flight[mid]
-                    self.agent.pending_inbox.appendleft(msg)
-                    logger.warning("Reaper: re-queued unacked message %s", mid)
+                requeued = self._requeue_expired_in_flight_locked(now, "reaper")
+            if requeued == 0:
+                continue
+
+            await self._wake_pending_delivery("reaper")
+
+    async def _wake_pending_delivery(self, source: str):
+        """Trigger delivery after pending messages become available."""
+        if self.agent.process is None:
+            logger.info("%s: restarting Claude to deliver pending messages", source)
+            await self._start_claude()
+        elif self.agent.is_busy:
+            await self._deliver_busy_notification()
+        else:
+            await self._deliver_pending_idle()
 
     async def _cleanup(self):
         """Clean up resources."""
