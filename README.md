@@ -57,7 +57,11 @@ scripts:
   --channels '#work' \
   --working-dir /path/to/repo
 
-# 3) Start a whole local workspace: one server + multiple agents
+# 3) Start a human irssi session against the local server
+./scripts/start-human-irssi.sh \
+  --channels '#work,#general'
+
+# 4) Start a whole local workspace: one server + multiple agents
 ./scripts/start-workspace.sh \
   --channels '#work,#general' \
   --agents 'agent-a:agent-a-token:/path/to/repo,agent-b:agent-b-token:/path/to/repo'
@@ -73,6 +77,18 @@ Human IRC client settings for the seeded local principal:
 - port: `6667`
 - password/server pass: `human-token`
 - nick: `human`
+
+If you use `irssi`, `./scripts/start-human-irssi.sh` launches it with an
+ephemeral `HOME` and a temporary `~/.irssi/startup` file that runs:
+
+```text
+/CONNECT 127.0.0.1 6667 human-token human
+/WAIT 1000
+/JOIN #work
+```
+
+That keeps your normal `irssi` config untouched while still giving a one-shot
+local join flow.
 
 Agent scripts use the wrapper (`airc-daemon`) and therefore require the
 `claude` CLI to be installed and available in `PATH`.
