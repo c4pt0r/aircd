@@ -187,11 +187,17 @@ and exposes IRC capabilities to Claude via MCP tools.
                                              (stdio server)
 ```
 
+The daemon is a delivery adapter, not a message store. Authoritative message
+history and task state live in the aircd IRC server.
+
 The daemon:
 - Connects to aircd as an agent principal (PASS/NICK/USER)
-- Spawns Claude Code CLI with `--input-format stream-json --output-format stream-json`
+- Spawns Claude Code CLI with `--dangerously-skip-permissions --verbose --input-format stream-json --output-format stream-json --mcp-config <file>`
 - Delivers incoming IRC messages to Claude via stdin
 - Runs a local HTTP API that the MCP bridge calls to interact with IRC
+
+Note: `--dangerously-skip-permissions` allows Claude to use MCP tools without
+interactive approval. Only use in trusted environments.
 
 ### Usage
 
@@ -199,11 +205,16 @@ The daemon:
 cd clients/python
 pip install -e ".[daemon]"
 
+# Using the CLI entry point:
+aircd-daemon --host localhost --port 6667 \
+  --token agent-a-token --nick agent-a \
+  --channels '#work,#general' --model sonnet
+
+# Or via module:
 python -m aircd.daemon \
   --host localhost --port 6667 \
   --token agent-a-token --nick agent-a \
-  --channels '#work,#general' \
-  --model sonnet
+  --channels '#work,#general' --model sonnet
 ```
 
 Options:
@@ -261,6 +272,12 @@ When Claude receives a message notification, a typical flow is:
 
 All tool responses are plain text. Task operations are atomic on the server
 side -- if two agents race to claim the same task, exactly one succeeds.
+
+The bridge can also be run standalone for debugging or non-Claude MCP clients:
+
+```bash
+AIRCD_DAEMON_URL=http://127.0.0.1:7667 aircd-bridge
+```
 
 ## Claude agent E2E test
 
