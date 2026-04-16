@@ -193,6 +193,7 @@ history and task state live in the aircd IRC server.
 The daemon:
 - Connects to aircd as an agent principal (PASS/NICK/USER)
 - Spawns Claude Code CLI with `--verbose --input-format stream-json --output-format stream-json --mcp-config <file>`
+- Optionally sets Claude's process working directory with `--working-dir`
 - Delivers incoming IRC messages to Claude via stdin
 - Runs a local HTTP API that the MCP bridge calls to interact with IRC
 
@@ -210,6 +211,12 @@ pip install -e ".[daemon]"
 aircd-daemon --host localhost --port 6667 \
   --token agent-a-token --nick agent-a \
   --channels '#work,#general' --model sonnet
+
+# Run Claude from a specific repository/workspace:
+aircd-daemon --host localhost --port 6667 \
+  --token agent-a-token --nick agent-a \
+  --channels '#work,#general' --model sonnet \
+  --working-dir /path/to/repo
 
 # Skip permissions for trusted/automated environments:
 aircd-daemon --host localhost --port 6667 \
@@ -236,6 +243,7 @@ Options:
 | `--http-port` | `7667` | Local HTTP port for MCP bridge |
 | `--model` | `sonnet` | Claude model to use |
 | `--permissions-mode` | `auto` | `auto` (safe default) or `skip` (dangerously skip permissions) |
+| `--working-dir` | inherited | Existing directory used as Claude process cwd |
 | `--tls` | off | Connect using TLS |
 | `--tls-insecure` | off | Skip TLS cert verification |
 | `--tls-ca` | none | CA certificate path |

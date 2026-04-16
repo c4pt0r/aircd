@@ -95,6 +95,17 @@ def find_claude_cli() -> str:
     )
 
 
+def resolve_working_dir(path: Optional[str]) -> Optional[str]:
+    """Resolve and validate the working directory for the Claude process."""
+    if not path:
+        return None
+
+    resolved = os.path.abspath(os.path.expanduser(path))
+    if not os.path.isdir(resolved):
+        raise ValueError(f"working directory does not exist: {path}")
+    return resolved
+
+
 def encode_stdin_message(text: str, session_id: Optional[str] = None) -> str:
     """Encode a user message in Claude's stream-json stdin format."""
     msg = {
@@ -358,6 +369,7 @@ class Daemon:
         http_port: int = 7667,
         claude_model: str = "sonnet",
         permissions_mode: str = "auto",
+        working_dir: Optional[str] = None,
         tls: bool = False,
         tls_verify: bool = True,
         tls_ca_path: Optional[str] = None,
@@ -370,6 +382,7 @@ class Daemon:
         self.http_port = http_port
         self.claude_model = claude_model
         self.permissions_mode = permissions_mode
+        self.working_dir = resolve_working_dir(working_dir)
         self.tls = tls
         self.tls_verify = tls_verify
         self.tls_ca_path = tls_ca_path
@@ -499,13 +512,18 @@ class Daemon:
             f"When you receive a system notification about new messages, call "
             f"check_messages to read them and respond appropriately."
         )
+        if self.working_dir:
+            initial_prompt += f" Your working directory is {self.working_dir}."
 
         logger.info("Starting Claude: %s", " ".join(args))
+        if self.working_dir:
+            logger.info("Claude working directory: %s", self.working_dir)
         proc = subprocess.Popen(
             args,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            cwd=self.working_dir,
         )
         self.agent.process = proc
 
@@ -1038,6 +1056,15 @@ def main():
         ),
     )
     parser.add_argument(
+        "--working-dir",
+        default=None,
+        help=(
+            "Working directory for the Claude Code process. Relative paths are "
+            "resolved from the daemon's current directory. Defaults to inheriting "
+            "the daemon working directory."
+        ),
+    )
+    parser.add_argument(
         "--tls",
         action="store_true",
         help="Connect to server using TLS",
@@ -1067,19 +1094,23 @@ def main():
 
     channels = [ch.strip() for ch in args.channels.split(",") if ch.strip()]
 
-    daemon = Daemon(
-        host=args.host,
-        port=args.port,
-        token=args.token,
-        nick=args.nick,
-        channels=channels,
-        http_port=args.http_port,
-        claude_model=args.model,
-        permissions_mode=args.permissions_mode,
-        tls=args.tls,
-        tls_verify=not args.tls_insecure,
-        tls_ca_path=args.tls_ca,
-    )
+    try:
+        daemon = Daemon(
+            host=args.host,
+            port=args.port,
+            token=args.token,
+            nick=args.nick,
+            channels=channels,
+            http_port=args.http_port,
+            claude_model=args.model,
+            permissions_mode=args.permissions_mode,
+            working_dir=args.working_dir,
+            tls=args.tls,
+            tls_verify=not args.tls_insecure,
+            tls_ca_path=args.tls_ca,
+        )
+    except ValueError as e:
+        parser.error(str(e))
 
     loop = asyncio.new_event_loop()
 
