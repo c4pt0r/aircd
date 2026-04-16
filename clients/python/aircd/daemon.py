@@ -357,6 +357,7 @@ class Daemon:
         channels: list[str],
         http_port: int = 7667,
         claude_model: str = "sonnet",
+        permissions_mode: str = "auto",
         tls: bool = False,
         tls_verify: bool = True,
         tls_ca_path: Optional[str] = None,
@@ -368,6 +369,7 @@ class Daemon:
         self.channels = channels
         self.http_port = http_port
         self.claude_model = claude_model
+        self.permissions_mode = permissions_mode
         self.tls = tls
         self.tls_verify = tls_verify
         self.tls_ca_path = tls_ca_path
@@ -474,13 +476,15 @@ class Daemon:
 
         args = [
             claude_bin,
-            "--dangerously-skip-permissions",
             "--verbose",
             "--input-format", "stream-json",
             "--output-format", "stream-json",
             "--mcp-config", self._mcp_config_file.name,
             "--model", self.claude_model,
         ]
+
+        if self.permissions_mode == "skip":
+            args.insert(1, "--dangerously-skip-permissions")
 
         if self.agent.session_id:
             args.extend(["--resume", self.agent.session_id])
@@ -1024,6 +1028,16 @@ def main():
         help="Claude model to use (default: sonnet)",
     )
     parser.add_argument(
+        "--permissions-mode",
+        choices=["auto", "skip"],
+        default="auto",
+        help=(
+            "Claude Code permissions mode. 'auto' uses default safe permissions; "
+            "'skip' passes --dangerously-skip-permissions for trusted environments "
+            "(default: auto)"
+        ),
+    )
+    parser.add_argument(
         "--tls",
         action="store_true",
         help="Connect to server using TLS",
@@ -1061,6 +1075,7 @@ def main():
         channels=channels,
         http_port=args.http_port,
         claude_model=args.model,
+        permissions_mode=args.permissions_mode,
         tls=args.tls,
         tls_verify=not args.tls_insecure,
         tls_ca_path=args.tls_ca,

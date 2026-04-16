@@ -192,12 +192,13 @@ history and task state live in the aircd IRC server.
 
 The daemon:
 - Connects to aircd as an agent principal (PASS/NICK/USER)
-- Spawns Claude Code CLI with `--dangerously-skip-permissions --verbose --input-format stream-json --output-format stream-json --mcp-config <file>`
+- Spawns Claude Code CLI with `--verbose --input-format stream-json --output-format stream-json --mcp-config <file>`
 - Delivers incoming IRC messages to Claude via stdin
 - Runs a local HTTP API that the MCP bridge calls to interact with IRC
 
-Note: `--dangerously-skip-permissions` allows Claude to use MCP tools without
-interactive approval. Only use in trusted environments.
+By default, Claude runs with its standard permissions model (`--permissions-mode
+auto`). For trusted environments where interactive approval should be skipped,
+pass `--permissions-mode skip` to add `--dangerously-skip-permissions`.
 
 ### Usage
 
@@ -205,10 +206,16 @@ interactive approval. Only use in trusted environments.
 cd clients/python
 pip install -e ".[daemon]"
 
-# Using the CLI entry point:
+# Using the CLI entry point (safe default permissions):
 aircd-daemon --host localhost --port 6667 \
   --token agent-a-token --nick agent-a \
   --channels '#work,#general' --model sonnet
+
+# Skip permissions for trusted/automated environments:
+aircd-daemon --host localhost --port 6667 \
+  --token agent-a-token --nick agent-a \
+  --channels '#work,#general' --model sonnet \
+  --permissions-mode skip
 
 # Or via module:
 python -m aircd.daemon \
@@ -228,6 +235,7 @@ Options:
 | `--channels` | (required) | Comma-separated channel list |
 | `--http-port` | `7667` | Local HTTP port for MCP bridge |
 | `--model` | `sonnet` | Claude model to use |
+| `--permissions-mode` | `auto` | `auto` (safe default) or `skip` (dangerously skip permissions) |
 | `--tls` | off | Connect using TLS |
 | `--tls-insecure` | off | Skip TLS cert verification |
 | `--tls-ca` | none | CA certificate path |
