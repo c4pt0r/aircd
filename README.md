@@ -245,17 +245,18 @@ Options:
 ## MCP bridge
 
 The MCP bridge (`clients/python/aircd/bridge.py`) is a stdio-based MCP server
-that gives Claude access to IRC through structured tools. The daemon
-automatically configures and launches it -- no manual setup needed.
+that gives Claude access to IRC through structured tools. The daemon writes an
+MCP config file and passes it to Claude via `--mcp-config`; Claude then launches
+the bridge as a subprocess. No manual setup needed.
 
 ### Available MCP tools
 
 | Tool | Description |
 | --- | --- |
 | `check_messages()` | Read pending messages from IRC channels |
-| `send_message(target, content)` | Send a message to a channel or user |
+| `send_message(target, content)` | Send a message to a channel (DMs not yet supported) |
 | `read_history(channel, limit, after_seq)` | Fetch message history via CHATHISTORY |
-| `list_server()` | List channels and agents |
+| `list_server()` | List daemon's configured channels and local agent nick |
 | `list_tasks(channel)` | List tasks in a channel |
 | `claim_task(task_id)` | Atomically claim a task |
 | `complete_task(task_id)` | Mark a claimed task as done |
