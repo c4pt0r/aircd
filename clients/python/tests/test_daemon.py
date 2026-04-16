@@ -1,10 +1,20 @@
 """Unit tests for daemon watchdog, dedup, and lifecycle behavior."""
 
+import asyncio
 from http.server import HTTPServer
+import os
 import time
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from aircd.daemon import AgentState, Daemon, DaemonHTTPHandler, MAX_DEDUP_ENTRIES
+
+
+def discard_created_task(coro):
+    """Close mocked background coroutines so spawn tests do not leak tasks."""
+    coro.close()
+    return MagicMock()
 
 
 class TestDedupLRU:
@@ -157,7 +167,7 @@ class TestHttpLifecycle:
 class TestPermissionsMode:
     """Tests for --permissions-mode flag behavior."""
 
-    def _make_daemon(self, permissions_mode="auto"):
+    def _make_daemon(self, permissions_mode="auto", working_dir=None):
         return Daemon(
             host="127.0.0.1",
             port=6667,
@@ -165,7 +175,34 @@ class TestPermissionsMode:
             nick="agent",
             channels=["#test"],
             permissions_mode=permissions_mode,
+            working_dir=working_dir,
         )
+
+    def _mock_popen_and_start_claude(self, daemon, mock_popen):
+        mock_proc = MagicMock()
+        mock_proc.pid = 12345
+        mock_proc.stdin = MagicMock()
+        mock_proc.stdout = MagicMock()
+        mock_proc.stderr = MagicMock()
+        mock_popen.return_value = mock_proc
+
+        loop = asyncio.new_event_loop()
+        try:
+            with patch(
+                "aircd.daemon.asyncio.create_task",
+                side_effect=discard_created_task,
+            ):
+                loop.run_until_complete(daemon._start_claude())
+        finally:
+            loop.close()
+            if hasattr(daemon, "_mcp_config_file"):
+                try:
+                    os.unlink(daemon._mcp_config_file.name)
+                except OSError:
+                    pass
+
+        assert mock_popen.called
+        return mock_popen.call_args
 
     def test_default_permissions_mode_is_auto(self):
         daemon = Daemon(
@@ -180,48 +217,52 @@ class TestPermissionsMode:
     @patch("aircd.daemon.find_claude_cli", return_value="/usr/bin/claude")
     @patch("subprocess.Popen")
     def test_skip_mode_includes_dangerous_flag(self, mock_popen, mock_cli):
-        mock_proc = MagicMock()
-        mock_proc.pid = 12345
-        mock_proc.stdin = MagicMock()
-        mock_proc.stdout = MagicMock()
-        mock_proc.stderr = MagicMock()
-        mock_popen.return_value = mock_proc
-
         daemon = self._make_daemon(permissions_mode="skip")
-        # Call _start_claude synchronously enough to capture the Popen args
-        import asyncio
-        loop = asyncio.new_event_loop()
-        try:
-            loop.run_until_complete(daemon._start_claude())
-        except Exception:
-            pass  # May fail on task creation, we just need the Popen call
-        finally:
-            loop.close()
-
-        assert mock_popen.called
-        args = mock_popen.call_args[0][0]
+        call_args = self._mock_popen_and_start_claude(daemon, mock_popen)
+        args = call_args[0][0]
         assert "--dangerously-skip-permissions" in args
 
     @patch("aircd.daemon.find_claude_cli", return_value="/usr/bin/claude")
     @patch("subprocess.Popen")
     def test_auto_mode_omits_dangerous_flag(self, mock_popen, mock_cli):
-        mock_proc = MagicMock()
-        mock_proc.pid = 12345
-        mock_proc.stdin = MagicMock()
-        mock_proc.stdout = MagicMock()
-        mock_proc.stderr = MagicMock()
-        mock_popen.return_value = mock_proc
-
         daemon = self._make_daemon(permissions_mode="auto")
-        import asyncio
-        loop = asyncio.new_event_loop()
-        try:
-            loop.run_until_complete(daemon._start_claude())
-        except Exception:
-            pass
-        finally:
-            loop.close()
-
-        assert mock_popen.called
-        args = mock_popen.call_args[0][0]
+        call_args = self._mock_popen_and_start_claude(daemon, mock_popen)
+        args = call_args[0][0]
         assert "--dangerously-skip-permissions" not in args
+
+    def test_working_dir_defaults_to_none(self):
+        daemon = self._make_daemon()
+        assert daemon.working_dir is None
+
+    def test_working_dir_resolves_relative_directory(self, tmp_path, monkeypatch):
+        workdir = tmp_path / "repo"
+        workdir.mkdir()
+        monkeypatch.chdir(tmp_path)
+
+        daemon = self._make_daemon(working_dir="repo")
+
+        assert daemon.working_dir == str(workdir)
+
+    def test_working_dir_rejects_missing_directory(self, tmp_path):
+        missing = tmp_path / "missing"
+
+        with pytest.raises(ValueError, match="working directory does not exist"):
+            self._make_daemon(working_dir=str(missing))
+
+    def test_working_dir_rejects_file(self, tmp_path):
+        file_path = tmp_path / "not-a-dir"
+        file_path.write_text("not a directory")
+
+        with pytest.raises(ValueError, match="working directory does not exist"):
+            self._make_daemon(working_dir=str(file_path))
+
+    @patch("aircd.daemon.find_claude_cli", return_value="/usr/bin/claude")
+    @patch("subprocess.Popen")
+    def test_start_claude_passes_working_dir_to_popen(
+        self, mock_popen, mock_cli, tmp_path
+    ):
+        daemon = self._make_daemon(working_dir=str(tmp_path))
+
+        call_args = self._mock_popen_and_start_claude(daemon, mock_popen)
+
+        assert call_args.kwargs["cwd"] == str(tmp_path)
