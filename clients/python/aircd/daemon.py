@@ -483,14 +483,18 @@ class Daemon:
                 line = await loop.run_in_executor(None, proc.stdout.readline)
                 if not line:
                     logger.info("Claude process exited")
-                    self.agent.is_busy = False
-                    self.agent.process = None
-                    # Auto-restart if there are pending messages
-                    with self.inbox_lock:
-                        has_pending = bool(self.agent.pending_inbox)
-                    if has_pending:
-                        logger.info("Restarting Claude to deliver pending messages")
-                        await self._start_claude()
+                    # Ignore stale reader tasks from an older Claude process.
+                    # The watchdog can replace self.agent.process while this
+                    # reader is still draining EOF from the terminated process.
+                    if self.agent.process is proc:
+                        self.agent.is_busy = False
+                        self.agent.process = None
+                        # Auto-restart if there are pending messages
+                        with self.inbox_lock:
+                            has_pending = bool(self.agent.pending_inbox)
+                        if has_pending:
+                            logger.info("Restarting Claude to deliver pending messages")
+                            await self._start_claude()
                     break
 
                 line_str = line.decode("utf-8", errors="replace").strip()
@@ -607,6 +611,7 @@ class Daemon:
             proc.stdin.write((stdin_msg + "\n").encode("utf-8"))
             proc.stdin.flush()
             self.agent.is_busy = True
+            self.agent.last_stdout_activity = time.monotonic()
             logger.info("Delivered %d pending messages (idle mode)", len(messages))
         except (BrokenPipeError, OSError) as e:
             logger.error("Failed to write to Claude stdin: %s", e)
@@ -808,6 +813,7 @@ class Daemon:
                 if m:
                     msg_id = m.group(1)
             if msg_id and msg_id in self.agent.seen_msg_ids:
+                self.agent.seen_msg_ids.move_to_end(msg_id)
                 continue
             if msg_id:
                 self.agent.seen_msg_ids[msg_id] = True
