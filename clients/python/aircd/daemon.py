@@ -429,6 +429,7 @@ class Daemon:
                 self._irc_reader_loop(),
                 self._outgoing_sender_loop(),
                 self._turn_watchdog(),
+                self._in_flight_reaper(),
             )
         except asyncio.CancelledError:
             pass
@@ -916,6 +917,26 @@ class Daemon:
                     await asyncio.sleep(2.0)
                     break  # restart the outer loop
             await asyncio.sleep(0.1)
+
+    async def _in_flight_reaper(self):
+        """Periodically reap expired in-flight messages back to pending.
+
+        This ensures messages are recovered even if Claude never calls
+        check_messages again (e.g. after a crash or stuck turn).
+        """
+        while not self._shutdown:
+            await asyncio.sleep(MESSAGE_VISIBILITY_TIMEOUT / 2)
+            now = time.time()
+            with self.inbox_lock:
+                expired = [
+                    (mid, msg)
+                    for mid, (msg, delivered_at) in self.agent.in_flight.items()
+                    if now - delivered_at > MESSAGE_VISIBILITY_TIMEOUT
+                ]
+                for mid, msg in expired:
+                    del self.agent.in_flight[mid]
+                    self.agent.pending_inbox.appendleft(msg)
+                    logger.warning("Reaper: re-queued unacked message %s", mid)
 
     async def _cleanup(self):
         """Clean up resources."""
