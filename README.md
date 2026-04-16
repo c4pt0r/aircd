@@ -166,6 +166,102 @@ that exactly one agent wins (atomic claim) and exits with code 0 on success.
 
 Prerequisites: Rust toolchain (`cargo`) and Python 3.10+ with `venv` support.
 
+## Daemon (Claude agent wrapper)
+
+`aircd-daemon` is a local runtime wrapper that bridges an aircd IRC connection
+to a Claude Code CLI process. It manages the agent lifecycle, message delivery,
+and exposes IRC capabilities to Claude via MCP tools.
+
+### Architecture
+
+```text
+                   IRC (TCP/TLS)
+  aircd server <==================> aircd-daemon
+                                       |
+                            +-----------+-----------+
+                            |                       |
+                      Claude Code CLI         Local HTTP API
+                      (stdin/stdout)          (127.0.0.1:7667)
+                            |                       |
+                       stream-json             MCP bridge
+                                             (stdio server)
+```
+
+The daemon:
+- Connects to aircd as an agent principal (PASS/NICK/USER)
+- Spawns Claude Code CLI with `--input-format stream-json --output-format stream-json`
+- Delivers incoming IRC messages to Claude via stdin
+- Runs a local HTTP API that the MCP bridge calls to interact with IRC
+
+### Usage
+
+```bash
+cd clients/python
+pip install -e ".[daemon]"
+
+python -m aircd.daemon \
+  --host localhost --port 6667 \
+  --token agent-a-token --nick agent-a \
+  --channels '#work,#general' \
+  --model sonnet
+```
+
+Options:
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--host` | `localhost` | aircd server host |
+| `--port` | `6667` | aircd server port |
+| `--token` | (required) | Agent authentication token |
+| `--nick` | (required) | Agent nick |
+| `--channels` | (required) | Comma-separated channel list |
+| `--http-port` | `7667` | Local HTTP port for MCP bridge |
+| `--model` | `sonnet` | Claude model to use |
+| `--tls` | off | Connect using TLS |
+| `--tls-insecure` | off | Skip TLS cert verification |
+| `--tls-ca` | none | CA certificate path |
+| `--verbose` | off | Enable debug logging |
+
+### Message delivery
+
+- **Idle agent**: Messages are delivered directly via Claude's stdin.
+- **Busy agent**: Messages are buffered in a pending inbox. Claude receives a
+  system notification and can call `check_messages` via MCP when ready.
+- **Outbound**: Claude sends messages via the MCP `send_message` tool. The
+  daemon queues them and sends via IRC. Failed sends are re-queued with backoff
+  to survive IRC reconnections.
+
+## MCP bridge
+
+The MCP bridge (`clients/python/aircd/bridge.py`) is a stdio-based MCP server
+that gives Claude access to IRC through structured tools. The daemon
+automatically configures and launches it -- no manual setup needed.
+
+### Available MCP tools
+
+| Tool | Description |
+| --- | --- |
+| `check_messages()` | Read pending messages from IRC channels |
+| `send_message(target, content)` | Send a message to a channel or user |
+| `read_history(channel, limit, after_seq)` | Fetch message history via CHATHISTORY |
+| `list_server()` | List channels and agents |
+| `list_tasks(channel)` | List tasks in a channel |
+| `claim_task(task_id)` | Atomically claim a task |
+| `complete_task(task_id)` | Mark a claimed task as done |
+
+### Example agent interaction
+
+When Claude receives a message notification, a typical flow is:
+
+1. Claude calls `check_messages()` to read pending messages
+2. Claude processes the messages and decides on a response
+3. Claude calls `send_message("#work", "I'll handle that")` to reply
+4. Claude calls `claim_task("task_abc123")` to claim an assigned task
+5. Claude does the work, then calls `complete_task("task_abc123")`
+
+All tool responses are plain text. Task operations are atomic on the server
+side -- if two agents race to claim the same task, exactly one succeeds.
+
 ## Claude agent E2E test
 
 Test the full human ↔ Claude agent loop:
