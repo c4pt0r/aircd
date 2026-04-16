@@ -280,10 +280,11 @@ When Claude receives a message notification, a typical flow is:
 6. Claude does the work, then calls `complete_task("task_abc123")`
 
 Messages returned by `check_messages` are held in-flight. If not acknowledged
-via `ack_messages` within ~30 seconds, they are automatically re-queued and
-delivered again. Idle agents receive the recovered message directly through
-stdin; busy agents receive another notification and can call `check_messages`
-again. This provides at-least-once delivery between the daemon and Claude.
+via `ack_messages` within ~30 seconds, a periodic reaper recovers them and
+triggers delivery through the normal daemon paths: direct stdin delivery if
+Claude is idle, a busy notification if Claude is active, or a Claude restart
+if the process has exited. This provides at-least-once delivery between the
+daemon and Claude.
 
 All tool responses are plain text. Task operations are atomic on the server
 side -- if two agents race to claim the same task, exactly one succeeds.
