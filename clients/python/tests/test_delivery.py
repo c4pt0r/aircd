@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 import pytest
 
 from aircd.client import Message
+from aircd.daemon import Daemon
 
 
 # --- Helpers: extract the delivery buffer logic into testable pieces ---
@@ -213,3 +214,71 @@ class TestMultipleMessageDelivery:
         result = check_messages(agent, now + MESSAGE_VISIBILITY_TIMEOUT + 1)
         assert len(result) == 1
         assert result[0]["delivery_id"] == "m2"
+
+
+class TestDaemonReaper:
+    def test_requeue_expired_in_flight_locked(self):
+        daemon = Daemon(
+            host="127.0.0.1",
+            port=6667,
+            token="agent-token",
+            nick="agent",
+            channels=["#test"],
+        )
+        msg = _make_msg("#test", "alice", "hello", raw="@msg-id=m1")
+        now = time.time()
+        daemon.agent.in_flight["m1"] = (
+            msg,
+            now - MESSAGE_VISIBILITY_TIMEOUT - 1,
+        )
+
+        with daemon.inbox_lock:
+            requeued = daemon._requeue_expired_in_flight_locked(now, "test")
+
+        assert requeued == 1
+        assert "m1" not in daemon.agent.in_flight
+        assert list(daemon.agent.pending_inbox) == [msg]
+
+    @pytest.mark.asyncio
+    async def test_wake_pending_delivery_idle(self):
+        daemon = Daemon(
+            host="127.0.0.1",
+            port=6667,
+            token="agent-token",
+            nick="agent",
+            channels=["#test"],
+        )
+        calls = []
+
+        async def fake_deliver():
+            calls.append("idle")
+
+        daemon._deliver_pending_idle = fake_deliver
+        daemon.agent.process = object()
+        daemon.agent.is_busy = False
+
+        await daemon._wake_pending_delivery("test")
+
+        assert calls == ["idle"]
+
+    @pytest.mark.asyncio
+    async def test_wake_pending_delivery_busy(self):
+        daemon = Daemon(
+            host="127.0.0.1",
+            port=6667,
+            token="agent-token",
+            nick="agent",
+            channels=["#test"],
+        )
+        calls = []
+
+        async def fake_notify():
+            calls.append("busy")
+
+        daemon._deliver_busy_notification = fake_notify
+        daemon.agent.process = object()
+        daemon.agent.is_busy = True
+
+        await daemon._wake_pending_delivery("test")
+
+        assert calls == ["busy"]
