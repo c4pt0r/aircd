@@ -376,6 +376,8 @@ class Daemon:
         self.agent = AgentState()
         self.inbox_lock = Lock()
         self.outgoing_queue: deque = deque()
+        self._http_server: Optional[HTTPServer] = None
+        self._http_thread: Optional[Thread] = None
 
         # Sync request/response maps keyed by correlation ID
         self._history_requests: dict[str, SyncRequest] = {}
@@ -429,9 +431,18 @@ class Daemon:
 
     def _start_http_server(self):
         """Start the local HTTP server for MCP bridge communication."""
+        if self._http_server is not None:
+            raise RuntimeError("daemon HTTP server is already running")
+
         DaemonHTTPHandler.daemon = self
         server = HTTPServer(("127.0.0.1", self.http_port), DaemonHTTPHandler)
-        thread = Thread(target=server.serve_forever, daemon=True)
+        thread = Thread(
+            target=server.serve_forever,
+            name=f"aircd-daemon-http-{self.http_port}",
+            daemon=True,
+        )
+        self._http_server = server
+        self._http_thread = thread
         thread.start()
         logger.info("Daemon HTTP API running on http://127.0.0.1:%d", self.http_port)
 
@@ -954,6 +965,7 @@ class Daemon:
     async def _cleanup(self):
         """Clean up resources."""
         self._shutdown = True
+        await asyncio.to_thread(self._shutdown_http_server)
         if self.agent.process:
             try:
                 self.agent.process.terminate()
@@ -967,6 +979,26 @@ class Daemon:
                 os.unlink(self._mcp_config_file.name)
             except OSError:
                 pass
+
+    def _shutdown_http_server(self):
+        """Stop the local HTTP bridge server and close its listening socket."""
+        server = self._http_server
+        thread = self._http_thread
+        self._http_server = None
+        self._http_thread = None
+
+        if server is None:
+            return
+
+        try:
+            logger.info("Shutting down daemon HTTP API")
+            if thread and thread.is_alive():
+                server.shutdown()
+                thread.join(timeout=2.0)
+                if thread.is_alive():
+                    logger.warning("Daemon HTTP thread did not stop within timeout")
+        finally:
+            server.server_close()
 
 
 def main():

@@ -1,9 +1,10 @@
 """Unit tests for daemon watchdog and dedup behavior."""
 
+from http.server import HTTPServer
 import time
 from unittest.mock import MagicMock
 
-from aircd.daemon import AgentState, MAX_DEDUP_ENTRIES
+from aircd.daemon import AgentState, Daemon, DaemonHTTPHandler, MAX_DEDUP_ENTRIES
 
 
 class TestDedupLRU:
@@ -107,3 +108,47 @@ class TestWatchdogTimestamp:
         # State should be unchanged because process identity doesn't match
         assert state.process is new_proc
         assert state.is_busy is True
+
+
+class TestHttpLifecycle:
+    def test_shutdown_http_server_is_noop_when_not_started(self):
+        daemon = Daemon(
+            host="127.0.0.1",
+            port=6667,
+            token="agent-token",
+            nick="agent",
+            channels=["#test"],
+        )
+
+        daemon._shutdown_http_server()
+
+        assert daemon._http_server is None
+        assert daemon._http_thread is None
+
+    def test_shutdown_http_server_closes_thread_and_socket(self):
+        daemon = Daemon(
+            host="127.0.0.1",
+            port=6667,
+            token="agent-token",
+            nick="agent",
+            channels=["#test"],
+            http_port=0,
+        )
+
+        daemon._start_http_server()
+        server = daemon._http_server
+        thread = daemon._http_thread
+        assert server is not None
+        assert thread is not None
+        assert thread.is_alive()
+        bound_port = server.server_address[1]
+
+        daemon._shutdown_http_server()
+
+        assert daemon._http_server is None
+        assert daemon._http_thread is None
+        assert not thread.is_alive()
+
+        # The listener socket should be closed and reusable after cleanup.
+        replacement = HTTPServer(("127.0.0.1", bound_port), DaemonHTTPHandler)
+        replacement.server_close()
