@@ -266,3 +266,128 @@ class TestPermissionsMode:
         call_args = self._mock_popen_and_start_claude(daemon, mock_popen)
 
         assert call_args.kwargs["cwd"] == str(tmp_path)
+
+
+class TestOutboundQueue:
+    """Tests for loop-owned outbound queue thread safety."""
+
+    def test_outgoing_queue_not_created_before_run(self):
+        """Queue is None until the event loop initializes it."""
+        daemon = Daemon(
+            host="127.0.0.1",
+            port=6667,
+            token="agent-token",
+            nick="agent",
+            channels=["#test"],
+        )
+        assert daemon._outgoing_queue is None
+
+    def test_http_enqueue_via_call_soon_threadsafe(self):
+        """Verify HTTP handler enqueues through the event loop, not directly."""
+        daemon = Daemon(
+            host="127.0.0.1",
+            port=6667,
+            token="agent-token",
+            nick="agent",
+            channels=["#test"],
+        )
+        loop = asyncio.new_event_loop()
+        try:
+            queue = asyncio.Queue()
+            daemon._loop = loop
+            daemon._outgoing_queue = queue
+
+            # Simulate what the HTTP handler does
+            loop.call_soon_threadsafe(queue.put_nowait, ("#test", "hello"))
+
+            # Drain one iteration to process the call_soon_threadsafe callback
+            loop.run_until_complete(asyncio.sleep(0))
+
+            assert not queue.empty()
+            item = loop.run_until_complete(queue.get())
+            assert item == ("#test", "hello")
+        finally:
+            loop.close()
+
+    def test_http_send_returns_503_when_loop_not_ready(self):
+        """Verify send_message returns 503 if daemon loop not initialized."""
+        daemon = Daemon(
+            host="127.0.0.1",
+            port=6667,
+            token="agent-token",
+            nick="agent",
+            channels=["#test"],
+            http_port=0,
+        )
+        daemon._start_http_server()
+        try:
+            server = daemon._http_server
+            port = server.server_address[1]
+
+            import urllib.request
+            import urllib.error
+            import json
+
+            data = json.dumps({"target": "#test", "content": "hello"}).encode()
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/messages/send",
+                data=data,
+                method="POST",
+            )
+            req.add_header("Content-Type", "application/json")
+
+            with pytest.raises(urllib.error.HTTPError) as exc_info:
+                urllib.request.urlopen(req)
+
+            assert exc_info.value.code == 503
+            result = json.loads(exc_info.value.read())
+            assert result.get("error") == "daemon not ready"
+        finally:
+            daemon._shutdown_http_server()
+
+    def test_sender_loop_drains_queue(self):
+        """Verify _outgoing_sender_loop sends queued messages via IRC."""
+        daemon = Daemon(
+            host="127.0.0.1",
+            port=6667,
+            token="agent-token",
+            nick="agent",
+            channels=["#test"],
+        )
+
+        loop = asyncio.new_event_loop()
+        try:
+            queue = asyncio.Queue()
+            daemon._outgoing_queue = queue
+            daemon._loop = loop
+
+            mock_irc = MagicMock()
+            sent = []
+
+            async def mock_privmsg(target, content):
+                sent.append((target, content))
+
+            mock_irc.privmsg = mock_privmsg
+            daemon.irc = mock_irc
+
+            # Enqueue a message, then set shutdown after first drain
+            queue.put_nowait(("#test", "msg1"))
+
+            async def run_test():
+                async def stop_after_send():
+                    while not sent:
+                        await asyncio.sleep(0.01)
+                    daemon._shutdown = True
+                    # Put a sentinel to unblock the queue.get()
+                    queue.put_nowait(("__stop__", ""))
+
+                await asyncio.gather(
+                    daemon._outgoing_sender_loop(),
+                    stop_after_send(),
+                )
+
+            loop.run_until_complete(run_test())
+
+            assert ("#test", "msg1") in sent
+        finally:
+            loop.close()

@@ -243,14 +243,25 @@ class DaemonHTTPHandler(BaseHTTPRequestHandler):
         self._respond_json({"acked": acked})
 
     def _handle_send_message(self):
-        """Queue a PRIVMSG to be sent via IRC."""
+        """Queue a PRIVMSG to be sent via IRC.
+
+        Returns {"status": "queued"} on success. This means the daemon
+        accepted the message into its local outbound buffer — it does NOT
+        mean the IRC server has persisted the message or that other
+        clients/agents have received it.
+        """
         body = self._read_body()
         target = body.get("target", "")
         content = body.get("content", "")
         if not target or not content:
             self._respond_json({"error": "target and content required"}, 400)
             return
-        self.daemon.outgoing_queue.append((target, content))
+        loop = self.daemon._loop
+        queue = self.daemon._outgoing_queue
+        if not loop or not queue:
+            self._respond_json({"error": "daemon not ready"}, 503)
+            return
+        loop.call_soon_threadsafe(queue.put_nowait, (target, content))
         self._respond_json({"status": "queued"})
 
     def _handle_history(self):
@@ -390,7 +401,11 @@ class Daemon:
         self.irc: Optional[AircdClient] = None
         self.agent = AgentState()
         self.inbox_lock = Lock()
-        self.outgoing_queue: deque = deque()
+        # Outbound message queue: owned by the asyncio event loop. HTTP handler
+        # threads enqueue via loop.call_soon_threadsafe(); the sender loop
+        # drains via await queue.get(). This replaces the previous cross-thread
+        # deque and provides an explicit concurrency boundary.
+        self._outgoing_queue: Optional[asyncio.Queue] = None
         self._http_server: Optional[HTTPServer] = None
         self._http_thread: Optional[Thread] = None
 
@@ -406,6 +421,7 @@ class Daemon:
     async def run(self):
         """Main daemon loop."""
         self._loop = asyncio.get_event_loop()
+        self._outgoing_queue = asyncio.Queue()
 
         # Start local HTTP API for the MCP bridge
         self._start_http_server()
@@ -922,25 +938,23 @@ class Daemon:
     async def _outgoing_sender_loop(self):
         """Send queued outgoing messages via IRC.
 
-        On send failure (e.g. disconnected writer during reconnect), the
-        message is re-queued at the front and we back off to let the IRC
-        client reconnect before retrying.
+        Drains the loop-owned asyncio.Queue. On send failure (e.g.
+        disconnected writer during reconnect), the message is re-queued
+        and we back off to let the IRC client reconnect before retrying.
         """
+        queue = self._outgoing_queue
         while not self._shutdown:
-            while self.outgoing_queue:
-                target, content = self.outgoing_queue.popleft()
-                try:
-                    await self.irc.privmsg(target, content)
-                    logger.info("Sent to %s: %s", target, content[:80])
-                except Exception as e:
-                    logger.warning(
-                        "Send to %s failed (will retry): %s", target, e
-                    )
-                    self.outgoing_queue.appendleft((target, content))
-                    # Back off to let the IRC client reconnect
-                    await asyncio.sleep(2.0)
-                    break  # restart the outer loop
-            await asyncio.sleep(0.1)
+            target, content = await queue.get()
+            try:
+                await self.irc.privmsg(target, content)
+                logger.info("Sent to %s: %s", target, content[:80])
+            except Exception as e:
+                logger.warning(
+                    "Send to %s failed (will retry): %s", target, e
+                )
+                await queue.put((target, content))
+                # Back off to let the IRC client reconnect
+                await asyncio.sleep(2.0)
 
     def _requeue_expired_in_flight_locked(self, now: float, source: str) -> int:
         """Move expired in-flight messages back to pending.
