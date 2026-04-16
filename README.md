@@ -79,12 +79,14 @@ Human IRC client settings for the seeded local principal:
 - nick: `human`
 
 If you use `irssi`, `./scripts/start-human-irssi.sh` launches it with an
-ephemeral `HOME` and a temporary `~/.irssi/startup` file that runs:
+ephemeral `HOME` and a temporary `~/.irssi/startup` file that creates a
+temporary `aircd-local` network, adds auto-join channels, and then connects:
 
 ```text
-/CONNECT 127.0.0.1 6667 human-token human
-/WAIT 1000
-/JOIN #work
+/NETWORK ADD -nick human aircd-local
+/SERVER ADD -auto -network aircd-local 127.0.0.1 6667 human-token
+/CHANNEL ADD -auto #work aircd-local
+/CONNECT aircd-local
 ```
 
 That keeps your normal `irssi` config untouched while still giving a one-shot

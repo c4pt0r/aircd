@@ -17,6 +17,7 @@ NICK="${AIRCD_NICK:-human}"
 CHANNELS="${AIRCD_CHANNELS:-#work}"
 IRSSI_BIN="${IRSSI_BIN:-irssi}"
 TEMP_HOME=""
+NETWORK_NAME="aircd-local"
 
 usage() {
     cat <<EOF
@@ -94,13 +95,21 @@ cleanup() {
 }
 trap cleanup EXIT
 
-cat >"$IRSSI_HOME/startup" <<EOF
-/ECHO Using temporary irssi home: $IRSSI_HOME
-/CONNECT $HOST $PORT $PASSWORD $NICK
-/WAIT 1000
-/JOIN $CHANNELS
-/ECHO Connected to aircd as $NICK on $HOST:$PORT
-EOF
+{
+    echo "/ECHO Using temporary irssi home: $IRSSI_HOME"
+    echo "/NETWORK ADD -nick $NICK $NETWORK_NAME"
+    echo "/SERVER ADD -auto -network $NETWORK_NAME $HOST $PORT $PASSWORD"
+    IFS=',' read -r -a channel_list <<< "$CHANNELS"
+    for channel in "${channel_list[@]}"; do
+        channel="${channel#"${channel%%[![:space:]]*}"}"
+        channel="${channel%"${channel##*[![:space:]]}"}"
+        if [[ -n "$channel" ]]; then
+            echo "/CHANNEL ADD -auto $channel $NETWORK_NAME"
+        fi
+    done
+    echo "/CONNECT $NETWORK_NAME"
+    echo "/ECHO Connecting to aircd as $NICK on $HOST:$PORT"
+} >"$IRSSI_HOME/startup"
 
 echo "Launching irssi"
 echo "  host:     $HOST"
