@@ -244,7 +244,9 @@ Options:
 - **At-least-once delivery**: Messages fetched via `check_messages` are held
   in-flight with a 30-second visibility timeout. Claude must call
   `ack_messages(delivery_ids)` after processing. Unacknowledged messages are
-  re-queued by a periodic reaper and redelivered on the next fetch.
+  re-queued by a periodic reaper and delivered again through the appropriate
+  path: direct stdin when idle, a busy notification when busy, or Claude restart
+  if the process is not running.
 
 ## MCP bridge
 
@@ -279,8 +281,9 @@ When Claude receives a message notification, a typical flow is:
 
 Messages returned by `check_messages` are held in-flight. If not acknowledged
 via `ack_messages` within ~30 seconds, they are automatically re-queued and
-will be re-delivered on the next `check_messages` call. This provides
-at-least-once delivery between the daemon and Claude.
+delivered again. Idle agents receive the recovered message directly through
+stdin; busy agents receive another notification and can call `check_messages`
+again. This provides at-least-once delivery between the daemon and Claude.
 
 All tool responses are plain text. Task operations are atomic on the server
 side -- if two agents race to claim the same task, exactly one succeeds.
