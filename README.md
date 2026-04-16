@@ -241,6 +241,10 @@ Options:
 - **Outbound**: Claude sends messages via the MCP `send_message` tool. The
   daemon queues them and sends via IRC. Failed sends are re-queued with backoff
   to survive IRC reconnections.
+- **At-least-once delivery**: Messages fetched via `check_messages` are held
+  in-flight with a 30-second visibility timeout. Claude must call
+  `ack_messages(delivery_ids)` after processing. Unacknowledged messages are
+  re-queued by a periodic reaper and redelivered on the next fetch.
 
 ## MCP bridge
 
@@ -253,7 +257,8 @@ the bridge as a subprocess. No manual setup needed.
 
 | Tool | Description |
 | --- | --- |
-| `check_messages()` | Read pending messages from IRC channels |
+| `check_messages()` | Read pending messages (held in-flight until ACKed) |
+| `ack_messages(delivery_ids)` | Acknowledge processed messages by delivery ID |
 | `send_message(target, content)` | Send a message to a channel (DMs not yet supported) |
 | `read_history(channel, limit, after_seq)` | Fetch message history via CHATHISTORY |
 | `list_server()` | List daemon's configured channels and local agent nick |
@@ -267,9 +272,15 @@ When Claude receives a message notification, a typical flow is:
 
 1. Claude calls `check_messages()` to read pending messages
 2. Claude processes the messages and decides on a response
-3. Claude calls `send_message("#work", "I'll handle that")` to reply
-4. Claude calls `claim_task("task_abc123")` to claim an assigned task
-5. Claude does the work, then calls `complete_task("task_abc123")`
+3. Claude calls `ack_messages(["delivery_id_1", ...])` to confirm receipt
+4. Claude calls `send_message("#work", "I'll handle that")` to reply
+5. Claude calls `claim_task("task_abc123")` to claim an assigned task
+6. Claude does the work, then calls `complete_task("task_abc123")`
+
+Messages returned by `check_messages` are held in-flight. If not acknowledged
+via `ack_messages` within ~30 seconds, they are automatically re-queued and
+will be re-delivered on the next `check_messages` call. This provides
+at-least-once delivery between the daemon and Claude.
 
 All tool responses are plain text. Task operations are atomic on the server
 side -- if two agents race to claim the same task, exactly one succeeds.
