@@ -27,7 +27,7 @@ import tempfile
 import time
 import urllib.parse
 from argparse import ArgumentParser
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from threading import Thread, Lock
@@ -46,6 +46,15 @@ MAX_PENDING = 200
 # Timeout for synchronous IRC request/response (seconds)
 IRC_REQUEST_TIMEOUT = 5.0
 
+# Watchdog: max seconds a Claude turn can run before force-idle + restart
+TURN_WATCHDOG_TIMEOUT = 600.0  # 10 minutes
+
+# Watchdog: how often to check for stuck turns (seconds)
+TURN_WATCHDOG_INTERVAL = 30.0
+
+# Maximum dedup entries before oldest are evicted (LRU bounded)
+MAX_DEDUP_ENTRIES = 10000
+
 
 @dataclass
 class AgentState:
@@ -56,7 +65,8 @@ class AgentState:
     is_busy: bool = False
     pending_inbox: deque = field(default_factory=deque)
     last_notification_time: float = 0.0
-    seen_msg_ids: set = field(default_factory=set)
+    seen_msg_ids: OrderedDict = field(default_factory=OrderedDict)
+    last_stdout_activity: float = 0.0  # monotonic time of last stdout event
 
 
 @dataclass
@@ -373,6 +383,7 @@ class Daemon:
             await asyncio.gather(
                 self._irc_reader_loop(),
                 self._outgoing_sender_loop(),
+                self._turn_watchdog(),
             )
         except asyncio.CancelledError:
             pass
@@ -456,6 +467,7 @@ class Daemon:
         asyncio.create_task(self._claude_stdout_reader())
         asyncio.create_task(self._claude_stderr_reader())
         self.agent.is_busy = True
+        self.agent.last_stdout_activity = time.monotonic()
 
         logger.info("Claude started (PID %d)", proc.pid)
 
@@ -471,14 +483,18 @@ class Daemon:
                 line = await loop.run_in_executor(None, proc.stdout.readline)
                 if not line:
                     logger.info("Claude process exited")
-                    self.agent.is_busy = False
-                    self.agent.process = None
-                    # Auto-restart if there are pending messages
-                    with self.inbox_lock:
-                        has_pending = bool(self.agent.pending_inbox)
-                    if has_pending:
-                        logger.info("Restarting Claude to deliver pending messages")
-                        await self._start_claude()
+                    # Ignore stale reader tasks from an older Claude process.
+                    # The watchdog can replace self.agent.process while this
+                    # reader is still draining EOF from the terminated process.
+                    if self.agent.process is proc:
+                        self.agent.is_busy = False
+                        self.agent.process = None
+                        # Auto-restart if there are pending messages
+                        with self.inbox_lock:
+                            has_pending = bool(self.agent.pending_inbox)
+                        if has_pending:
+                            logger.info("Restarting Claude to deliver pending messages")
+                            await self._start_claude()
                     break
 
                 line_str = line.decode("utf-8", errors="replace").strip()
@@ -492,6 +508,7 @@ class Daemon:
                     continue
 
                 event_type = event.get("type", "")
+                self.agent.last_stdout_activity = time.monotonic()
 
                 if event_type == "system":
                     sid = event.get("session_id")
@@ -532,6 +549,44 @@ class Daemon:
             except Exception:
                 break
 
+    async def _turn_watchdog(self):
+        """Periodic watchdog that detects stuck Claude turns.
+
+        If Claude is busy and no stdout activity has been seen for
+        TURN_WATCHDOG_TIMEOUT seconds, force-transition to idle and
+        restart the process. This covers both missing 'result' events
+        and functionally stuck (alive but unresponsive) processes.
+        """
+        while not self._shutdown:
+            await asyncio.sleep(TURN_WATCHDOG_INTERVAL)
+            if not self.agent.is_busy or not self.agent.process:
+                continue
+            elapsed = time.monotonic() - self.agent.last_stdout_activity
+            if elapsed < TURN_WATCHDOG_TIMEOUT:
+                continue
+            logger.warning(
+                "Watchdog: Claude busy for %.0fs with no stdout activity "
+                "(threshold %.0fs). Force-restarting.",
+                elapsed,
+                TURN_WATCHDOG_TIMEOUT,
+            )
+            # Force-kill the stuck process
+            proc = self.agent.process
+            if proc:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=5)
+                except Exception:
+                    proc.kill()
+            self.agent.is_busy = False
+            self.agent.process = None
+            # Restart if there are pending messages
+            with self.inbox_lock:
+                has_pending = bool(self.agent.pending_inbox)
+            if has_pending:
+                logger.info("Watchdog: restarting Claude to deliver pending messages")
+                await self._start_claude()
+
     async def _deliver_pending_idle(self):
         """Deliver pending messages directly via stdin when Claude is idle."""
         proc = self.agent.process
@@ -556,6 +611,7 @@ class Daemon:
             proc.stdin.write((stdin_msg + "\n").encode("utf-8"))
             proc.stdin.flush()
             self.agent.is_busy = True
+            self.agent.last_stdout_activity = time.monotonic()
             logger.info("Delivered %d pending messages (idle mode)", len(messages))
         except (BrokenPipeError, OSError) as e:
             logger.error("Failed to write to Claude stdin: %s", e)
@@ -757,11 +813,12 @@ class Daemon:
                 if m:
                     msg_id = m.group(1)
             if msg_id and msg_id in self.agent.seen_msg_ids:
+                self.agent.seen_msg_ids.move_to_end(msg_id)
                 continue
             if msg_id:
-                self.agent.seen_msg_ids.add(msg_id)
-                if len(self.agent.seen_msg_ids) > 10000:
-                    self.agent.seen_msg_ids.clear()
+                self.agent.seen_msg_ids[msg_id] = True
+                while len(self.agent.seen_msg_ids) > MAX_DEDUP_ENTRIES:
+                    self.agent.seen_msg_ids.popitem(last=False)
 
             logger.info("[%s] %s: %s", msg.channel, msg.sender, msg.content[:80])
 
