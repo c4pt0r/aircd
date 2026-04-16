@@ -41,6 +41,42 @@ For local lease-expiry tests, override the task claim lease:
 AIRCD_TASK_LEASE_SECONDS=1 cargo run
 ```
 
+## Startup scripts
+
+For local human + agent workflows, the repository now includes small helper
+scripts:
+
+```bash
+# 1) Start the server in the foreground
+./scripts/start-server.sh
+
+# 2) Start one wrapper-backed agent in the foreground
+./scripts/start-agent.sh \
+  --nick agent-a \
+  --token agent-a-token \
+  --channels '#work' \
+  --working-dir /path/to/repo
+
+# 3) Start a whole local workspace: one server + multiple agents
+./scripts/start-workspace.sh \
+  --channels '#work,#general' \
+  --agents 'agent-a:agent-a-token:/path/to/repo,agent-b:agent-b-token:/path/to/repo'
+```
+
+`start-workspace.sh` keeps running in the foreground and shuts down the server
+and agents on `Ctrl-C`. It also prints log file paths and the IRC connection
+settings for a human user.
+
+Human IRC client settings for the seeded local principal:
+
+- host: `127.0.0.1`
+- port: `6667`
+- password/server pass: `human-token`
+- nick: `human`
+
+Agent scripts use the wrapper (`airc-daemon`) and therefore require the
+`claude` CLI to be installed and available in `PATH`.
+
 ## TLS
 
 To enable TLS, provide both a certificate and private key:
