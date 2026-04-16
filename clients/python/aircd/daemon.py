@@ -219,6 +219,9 @@ class DaemonHTTPHandler(BaseHTTPRequestHandler):
                 msg_dict = message_to_dict(msg)
                 mid = msg_dict.get("msg_id") or f"noid_{id(msg)}"
                 self.daemon.agent.in_flight[mid] = (msg, now)
+                # Expose the delivery_id so the bridge can ACK all messages,
+                # including those without a server-assigned msg-id.
+                msg_dict["delivery_id"] = mid
                 messages.append(msg_dict)
         self._respond_json({"messages": messages})
 
@@ -693,6 +696,8 @@ class Daemon:
     async def _request_history(self, channel: str, after_seq: int, limit: int) -> list:
         """Send CHATHISTORY and collect replay responses synchronously."""
         key = channel
+        if key in self._history_requests:
+            raise ValueError(f"history request already in-flight for {key}")
         req = SyncRequest(channel=channel)
         self._history_requests[key] = req
 
@@ -709,6 +714,8 @@ class Daemon:
     async def _request_task_list(self, channel: str) -> list:
         """Send TASK LIST and collect response NOTICEs synchronously."""
         key = channel
+        if key in self._task_list_requests:
+            raise ValueError(f"task list request already in-flight for {key}")
         req = SyncRequest(channel=channel)
         self._task_list_requests[key] = req
 
@@ -725,6 +732,8 @@ class Daemon:
     async def _request_task_action(self, action: str, task_id: str) -> dict:
         """Send TASK CLAIM/DONE and wait for server success/failure NOTICE."""
         key = f"{action}:{task_id}"
+        if key in self._task_action_requests:
+            raise ValueError(f"task action request already in-flight for {key}")
         req = SyncRequest(task_id=task_id, action=action)
         self._task_action_requests[key] = req
 

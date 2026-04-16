@@ -50,12 +50,15 @@ def _format_message(msg: dict) -> str:
     """Format a message dict into slock-style envelope."""
     target = msg.get("channel", "")
     msg_id = msg.get("msg_id", "")
+    delivery_id = msg.get("delivery_id", "")
     time_val = msg.get("time", "")
     sender = msg.get("sender", "")
     content = msg.get("content", "")
     msg_type = msg.get("type", "")
 
     parts = [f"target={target}"]
+    if delivery_id:
+        parts.append(f"delivery_id={delivery_id}")
     if msg_id:
         parts.append(f"msg={msg_id}")
     if time_val:
@@ -73,8 +76,9 @@ def check_messages() -> str:
 
     Returns immediately with any pending messages from IRC channels,
     or 'No new messages' if none. Messages are held in-flight until
-    acknowledged. Call ack_messages with the returned msg_ids after
-    processing, or they will be re-delivered after a timeout.
+    acknowledged — call ack_messages with the delivery_ids shown in
+    each message envelope after you have processed them. Unacked
+    messages are re-delivered after ~30s.
 
     Use this freely during work — at natural breakpoints, after
     notifications, or whenever you want to see if anything new came in.
@@ -87,32 +91,22 @@ def check_messages() -> str:
     if not messages:
         return "No new messages."
 
-    # Auto-ack: collect msg_ids and ack immediately after successful fetch.
-    # This provides at-least-once semantics — if the bridge crashes between
-    # fetch and ack, messages will be re-delivered after visibility timeout.
-    msg_ids = [m.get("msg_id", "") for m in messages if m.get("msg_id")]
-    if msg_ids:
-        _daemon_post("/messages/ack", {"msg_ids": msg_ids})
-
     lines = [_format_message(m) for m in messages]
     return "\n".join(lines)
 
 
 @mcp.tool()
-def ack_messages(msg_ids: list[str]) -> str:
-    """Acknowledge receipt of messages by their IDs.
+def ack_messages(delivery_ids: list[str]) -> str:
+    """Acknowledge receipt of messages after processing.
 
-    Messages returned by check_messages are held in-flight. If not
-    acknowledged within the visibility timeout (~30s), they become
-    available again. This tool explicitly acknowledges messages.
-
-    Note: check_messages auto-acks on success, so this is only needed
-    if you want manual control over acknowledgement.
+    You MUST call this after processing messages from check_messages.
+    Pass the delivery_id values from the message envelopes. Unacked
+    messages are re-delivered after ~30s.
 
     Args:
-        msg_ids: List of message IDs to acknowledge.
+        delivery_ids: List of delivery_id values from check_messages output.
     """
-    result = _daemon_post("/messages/ack", {"msg_ids": msg_ids})
+    result = _daemon_post("/messages/ack", {"msg_ids": delivery_ids})
     if "error" in result:
         return f"Error acknowledging messages: {result['error']}"
     return f"Acknowledged {result.get('acked', 0)} message(s)."
