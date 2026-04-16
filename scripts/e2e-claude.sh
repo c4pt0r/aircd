@@ -82,6 +82,7 @@ echo "  Channel: $CHANNEL"
     --token agent-a-token --nick agent-a \
     --channels "$CHANNEL" \
     --model "$MODEL" \
+    --permissions-mode skip \
     --verbose \
     > /tmp/aircd-daemon-e2e.log 2>&1 &
 DAEMON_PID=$!

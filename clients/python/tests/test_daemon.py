@@ -1,8 +1,8 @@
-"""Unit tests for daemon watchdog and dedup behavior."""
+"""Unit tests for daemon watchdog, dedup, and lifecycle behavior."""
 
 from http.server import HTTPServer
 import time
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from aircd.daemon import AgentState, Daemon, DaemonHTTPHandler, MAX_DEDUP_ENTRIES
 
@@ -152,3 +152,76 @@ class TestHttpLifecycle:
         # The listener socket should be closed and reusable after cleanup.
         replacement = HTTPServer(("127.0.0.1", bound_port), DaemonHTTPHandler)
         replacement.server_close()
+
+
+class TestPermissionsMode:
+    """Tests for --permissions-mode flag behavior."""
+
+    def _make_daemon(self, permissions_mode="auto"):
+        return Daemon(
+            host="127.0.0.1",
+            port=6667,
+            token="agent-token",
+            nick="agent",
+            channels=["#test"],
+            permissions_mode=permissions_mode,
+        )
+
+    def test_default_permissions_mode_is_auto(self):
+        daemon = Daemon(
+            host="127.0.0.1",
+            port=6667,
+            token="agent-token",
+            nick="agent",
+            channels=["#test"],
+        )
+        assert daemon.permissions_mode == "auto"
+
+    @patch("aircd.daemon.find_claude_cli", return_value="/usr/bin/claude")
+    @patch("subprocess.Popen")
+    def test_skip_mode_includes_dangerous_flag(self, mock_popen, mock_cli):
+        mock_proc = MagicMock()
+        mock_proc.pid = 12345
+        mock_proc.stdin = MagicMock()
+        mock_proc.stdout = MagicMock()
+        mock_proc.stderr = MagicMock()
+        mock_popen.return_value = mock_proc
+
+        daemon = self._make_daemon(permissions_mode="skip")
+        # Call _start_claude synchronously enough to capture the Popen args
+        import asyncio
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(daemon._start_claude())
+        except Exception:
+            pass  # May fail on task creation, we just need the Popen call
+        finally:
+            loop.close()
+
+        assert mock_popen.called
+        args = mock_popen.call_args[0][0]
+        assert "--dangerously-skip-permissions" in args
+
+    @patch("aircd.daemon.find_claude_cli", return_value="/usr/bin/claude")
+    @patch("subprocess.Popen")
+    def test_auto_mode_omits_dangerous_flag(self, mock_popen, mock_cli):
+        mock_proc = MagicMock()
+        mock_proc.pid = 12345
+        mock_proc.stdin = MagicMock()
+        mock_proc.stdout = MagicMock()
+        mock_proc.stderr = MagicMock()
+        mock_popen.return_value = mock_proc
+
+        daemon = self._make_daemon(permissions_mode="auto")
+        import asyncio
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(daemon._start_claude())
+        except Exception:
+            pass
+        finally:
+            loop.close()
+
+        assert mock_popen.called
+        args = mock_popen.call_args[0][0]
+        assert "--dangerously-skip-permissions" not in args
