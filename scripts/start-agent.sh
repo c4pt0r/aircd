@@ -17,7 +17,7 @@ TOKEN="${AIRCD_TOKEN:-agent-a-token}"
 NICK="${AIRCD_NICK:-agent-a}"
 CHANNELS="${AIRCD_CHANNELS:-#work}"
 MODEL="${CLAUDE_MODEL:-sonnet}"
-PERMISSIONS_MODE="${AIRCD_PERMISSIONS_MODE:-auto}"
+PERMISSIONS_MODE="${AIRCD_PERMISSIONS_MODE:-skip}"
 WORKING_DIR="${AIRCD_WORKING_DIR:-$CALLER_DIR}"
 HTTP_PORT="${AIRCD_HTTP_PORT:-7667}"
 TLS=0
@@ -31,6 +31,8 @@ usage() {
 Usage: ./scripts/start-agent.sh [options]
 
 Starts one airc-daemon process in the foreground.
+This helper defaults to --permissions-mode skip because it is intended for
+headless local wrapper sessions.
 
 Options:
   --host HOST             aircd host (default: $HOST)
