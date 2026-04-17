@@ -197,52 +197,61 @@ impl Server {
                 self.cap(session, subcommand, capabilities)?;
             }
             Command::Join(channel) => {
-                self.ensure_registered(session)?;
-                self.join(session, normalize_channel(&channel))?;
+                if self.ensure_registered(session)? {
+                    self.join(session, normalize_channel(&channel))?;
+                }
             }
             Command::Part(channel) => {
-                self.ensure_registered(session)?;
-                self.part(session, normalize_channel(&channel))?;
+                if self.ensure_registered(session)? {
+                    self.part(session, normalize_channel(&channel))?;
+                }
             }
             Command::Privmsg { target, body } => {
-                self.ensure_registered(session)?;
-                self.privmsg(session, normalize_channel(&target), body)?;
+                if self.ensure_registered(session)? {
+                    self.privmsg(session, normalize_channel(&target), body)?;
+                }
             }
             Command::History {
                 channel,
                 after_seq,
                 limit,
             } => {
-                self.ensure_registered(session)?;
-                let channels = match channel {
-                    Some(channel) => vec![normalize_channel(&channel)],
-                    None => self
-                        .memberships(session.principal()?.id.as_str())?
-                        .into_iter()
-                        .map(|membership| membership.channel)
-                        .collect(),
-                };
-                self.replay_history(session, &channels, after_seq, limit)?;
+                if self.ensure_registered(session)? {
+                    let channels = match channel {
+                        Some(channel) => vec![normalize_channel(&channel)],
+                        None => self
+                            .memberships(session.principal()?.id.as_str())?
+                            .into_iter()
+                            .map(|membership| membership.channel)
+                            .collect(),
+                    };
+                    self.replay_history(session, &channels, after_seq, limit)?;
+                }
             }
             Command::TaskCreate { channel, title } => {
-                self.ensure_registered(session)?;
-                self.task_create(session, normalize_channel(&channel), title)?;
+                if self.ensure_registered(session)? {
+                    self.task_create(session, normalize_channel(&channel), title)?;
+                }
             }
             Command::TaskClaim(task_id) => {
-                self.ensure_registered(session)?;
-                self.task_claim(session, task_id)?;
+                if self.ensure_registered(session)? {
+                    self.task_claim(session, task_id)?;
+                }
             }
             Command::TaskDone(task_id) => {
-                self.ensure_registered(session)?;
-                self.task_done(session, task_id)?;
+                if self.ensure_registered(session)? {
+                    self.task_done(session, task_id)?;
+                }
             }
             Command::TaskRelease(task_id) => {
-                self.ensure_registered(session)?;
-                self.task_release(session, task_id)?;
+                if self.ensure_registered(session)? {
+                    self.task_release(session, task_id)?;
+                }
             }
             Command::TaskList(channel) => {
-                self.ensure_registered(session)?;
-                self.task_list(session, normalize_channel(&channel))?;
+                if self.ensure_registered(session)? {
+                    self.task_list(session, normalize_channel(&channel))?;
+                }
             }
             Command::Quit => return Ok(true),
             Command::Unknown(name) => {
@@ -697,10 +706,18 @@ impl Server {
         Ok(())
     }
 
-    fn ensure_registered(&self, session: &Session) -> Result<()> {
+    /// Check whether the session is registered and active.
+    ///
+    /// Returns `Ok(true)` if the session is registered and active. Returns
+    /// `Ok(false)` after sending a 451 reply when the session has not yet
+    /// completed registration — this is a non-fatal condition (per IRC
+    /// spec) and the connection stays open so the client can finish its
+    /// PASS/NICK/USER sequence. Only returns `Err` for truly fatal states
+    /// like a replaced session.
+    fn ensure_registered(&self, session: &Session) -> Result<bool> {
         if !session.registered {
             session.send(format!(":{SERVER_NAME} 451 * :You have not registered"));
-            return Err(anyhow!("not registered"));
+            return Ok(false);
         }
 
         let principal = session.principal()?;
@@ -719,7 +736,7 @@ impl Server {
             return Err(anyhow!("session replaced"));
         }
 
-        Ok(())
+        Ok(true)
     }
 
     fn mark_connected_and_memberships(&self, principal_id: &str) -> Result<Vec<Membership>> {
