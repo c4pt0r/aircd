@@ -23,7 +23,7 @@ usage() {
 Usage: ./scripts/start-human-irssi.sh [options]
 
 Launches irssi for the seeded human principal and auto-connects to aircd.
-The script creates a temporary HOME and ~/.irssi/startup file so your normal
+The script creates a temporary HOME and ~/.irssi config so your normal
 irssi configuration is left untouched.
 
 Options:
@@ -94,13 +94,51 @@ cleanup() {
 }
 trap cleanup EXIT
 
-cat >"$IRSSI_HOME/startup" <<EOF
-/ECHO Using temporary irssi home: $IRSSI_HOME
-/CONNECT $HOST $PORT $PASSWORD $NICK
-/WAIT 1000
-/JOIN $CHANNELS
-/ECHO Connected to aircd as $NICK on $HOST:$PORT
-EOF
+# Build autojoin channel list for irssi config format
+IFS=',' read -r -a CHANNEL_ARRAY <<< "$CHANNELS"
+AUTOJOIN_LIST=""
+for ch in "${CHANNEL_ARRAY[@]}"; do
+    ch="$(echo "$ch" | xargs)"  # trim whitespace
+    if [[ -n "$AUTOJOIN_LIST" ]]; then
+        AUTOJOIN_LIST="$AUTOJOIN_LIST $ch"
+    else
+        AUTOJOIN_LIST="$ch"
+    fi
+done
+
+# Generate irssi config file with proper network/server/nick/autojoin.
+# This avoids the /CONNECT positional arg issues and /WAIT race conditions
+# that caused "not registered" errors with the old startup-command approach.
+cat >"$IRSSI_HOME/config" <<IRSSI_CONFIG
+servers = (
+  {
+    address = "$HOST";
+    port = "$PORT";
+    password = "$PASSWORD";
+    chatnet = "aircd";
+    autoconnect = "yes";
+  }
+);
+
+chatnets = {
+  aircd = { type = "IRC"; nick = "$NICK"; };
+};
+
+channels = (
+$(for ch in "${CHANNEL_ARRAY[@]}"; do
+    ch="$(echo "$ch" | xargs)"
+    echo "  { name = \"$ch\"; chatnet = \"aircd\"; autojoin = \"yes\"; },"
+done)
+);
+
+settings = {
+  core = {
+    real_name = "$NICK";
+    user_name = "$NICK";
+    nick = "$NICK";
+  };
+};
+IRSSI_CONFIG
 
 echo "Launching irssi"
 echo "  host:     $HOST"
