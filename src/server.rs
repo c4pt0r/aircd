@@ -197,15 +197,21 @@ impl Server {
                 self.cap(session, subcommand, capabilities)?;
             }
             Command::Join(channel) => {
-                self.ensure_registered(session)?;
+                if !self.ensure_registered(session)? {
+                    return Ok(false);
+                }
                 self.join(session, normalize_channel(&channel))?;
             }
             Command::Part(channel) => {
-                self.ensure_registered(session)?;
+                if !self.ensure_registered(session)? {
+                    return Ok(false);
+                }
                 self.part(session, normalize_channel(&channel))?;
             }
             Command::Privmsg { target, body } => {
-                self.ensure_registered(session)?;
+                if !self.ensure_registered(session)? {
+                    return Ok(false);
+                }
                 self.privmsg(session, normalize_channel(&target), body)?;
             }
             Command::History {
@@ -213,7 +219,9 @@ impl Server {
                 after_seq,
                 limit,
             } => {
-                self.ensure_registered(session)?;
+                if !self.ensure_registered(session)? {
+                    return Ok(false);
+                }
                 let channels = match channel {
                     Some(channel) => vec![normalize_channel(&channel)],
                     None => self
@@ -225,23 +233,33 @@ impl Server {
                 self.replay_history(session, &channels, after_seq, limit)?;
             }
             Command::TaskCreate { channel, title } => {
-                self.ensure_registered(session)?;
+                if !self.ensure_registered(session)? {
+                    return Ok(false);
+                }
                 self.task_create(session, normalize_channel(&channel), title)?;
             }
             Command::TaskClaim(task_id) => {
-                self.ensure_registered(session)?;
+                if !self.ensure_registered(session)? {
+                    return Ok(false);
+                }
                 self.task_claim(session, task_id)?;
             }
             Command::TaskDone(task_id) => {
-                self.ensure_registered(session)?;
+                if !self.ensure_registered(session)? {
+                    return Ok(false);
+                }
                 self.task_done(session, task_id)?;
             }
             Command::TaskRelease(task_id) => {
-                self.ensure_registered(session)?;
+                if !self.ensure_registered(session)? {
+                    return Ok(false);
+                }
                 self.task_release(session, task_id)?;
             }
             Command::TaskList(channel) => {
-                self.ensure_registered(session)?;
+                if !self.ensure_registered(session)? {
+                    return Ok(false);
+                }
                 self.task_list(session, normalize_channel(&channel))?;
             }
             Command::Quit => return Ok(true),
@@ -697,10 +715,10 @@ impl Server {
         Ok(())
     }
 
-    fn ensure_registered(&self, session: &Session) -> Result<()> {
+    fn ensure_registered(&self, session: &Session) -> Result<bool> {
         if !session.registered {
             session.send(format!(":{SERVER_NAME} 451 * :You have not registered"));
-            return Err(anyhow!("not registered"));
+            return Ok(false);
         }
 
         let principal = session.principal()?;
@@ -719,7 +737,7 @@ impl Server {
             return Err(anyhow!("session replaced"));
         }
 
-        Ok(())
+        Ok(true)
     }
 
     fn mark_connected_and_memberships(&self, principal_id: &str) -> Result<Vec<Membership>> {
@@ -842,6 +860,7 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::{escape_tag_value, metadata_tags, Server, Session};
+    use crate::protocol::Command;
     use anyhow::Result;
     use tokio::sync::mpsc;
 
@@ -862,6 +881,26 @@ mod tests {
             tx,
             shutdown_tx,
         }
+    }
+
+    fn test_session_with_rx(
+        token: Option<&str>,
+        nick: Option<&str>,
+    ) -> (Session, mpsc::UnboundedReceiver<String>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (shutdown_tx, _shutdown_rx) = mpsc::unbounded_channel();
+        (
+            Session {
+                session_id: format!("sess_{}", uuid::Uuid::new_v4().simple()),
+                principal: None,
+                nick: nick.map(str::to_string),
+                pass_token: token.map(str::to_string),
+                registered: false,
+                tx,
+                shutdown_tx,
+            },
+            rx,
+        )
     }
 
     #[test]
@@ -929,6 +968,39 @@ mod tests {
             metadata_tags(42, "msg_abc", 1_776_250_000, true),
             "@seq=42;msg-id=msg_abc;time=1776250000;replay=1"
         );
+    }
+
+    #[tokio::test]
+    async fn unregistered_command_returns_451_without_closing_session() -> Result<()> {
+        let server = test_server()?;
+        let (mut session, mut rx) = test_session_with_rx(None, None);
+
+        let should_quit = server
+            .handle_command(&mut session, Command::Join("#work".to_string()))
+            .await?;
+        assert!(!should_quit);
+
+        let notice = rx.recv().await.expect("451 response");
+        assert_eq!(notice, ":aircd 451 * :You have not registered");
+        assert!(!session.registered);
+
+        server
+            .handle_command(&mut session, Command::Pass("human-token".to_string()))
+            .await?;
+        server
+            .handle_command(&mut session, Command::Nick("human".to_string()))
+            .await?;
+        server
+            .handle_command(&mut session, Command::User("human".to_string()))
+            .await?;
+        assert!(session.registered);
+
+        let should_quit = server
+            .handle_command(&mut session, Command::Join("#work".to_string()))
+            .await?;
+        assert!(!should_quit);
+
+        Ok(())
     }
 }
 
