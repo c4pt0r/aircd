@@ -71,6 +71,10 @@ scripts:
 and agents on `Ctrl-C`. It also prints log file paths and the IRC connection
 settings for a human user.
 
+The helper scripts default agent wrappers to `--permissions-mode skip` because
+they are intended for unattended local sessions. The underlying `airc-daemon`
+CLI still defaults to safe `--permissions-mode auto` unless you opt in.
+
 Human IRC client settings for the seeded local principal:
 
 - host: `127.0.0.1`
