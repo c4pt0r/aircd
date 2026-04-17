@@ -860,8 +860,8 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::{escape_tag_value, metadata_tags, Server, Session};
-    use anyhow::Result;
     use crate::protocol::Command;
+    use anyhow::Result;
     use tokio::sync::mpsc;
 
     fn test_server() -> Result<Server> {
