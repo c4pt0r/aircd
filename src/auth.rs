@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::tokens;
@@ -14,11 +15,15 @@ pub struct Principal {
 #[derive(Clone)]
 pub struct AuthStore {
     db: Arc<Mutex<Connection>>,
+    legacy_hits: Arc<AtomicU64>,
 }
 
 impl AuthStore {
     pub fn new(db: Arc<Mutex<Connection>>) -> Self {
-        Self { db }
+        Self {
+            db,
+            legacy_hits: Arc::new(AtomicU64::new(0)),
+        }
     }
 
     /// Authenticate an incoming token. Tries the new `principal_tokens` path
@@ -33,7 +38,21 @@ impl AuthStore {
             }
         }
 
-        self.authenticate_legacy(token)
+        let principal = self.authenticate_legacy(token)?;
+        let total = self.legacy_hits.fetch_add(1, Ordering::Relaxed) + 1;
+        eprintln!(
+            "auth: legacy plaintext token accepted for principal {} (legacy_hits={})",
+            principal.nick, total,
+        );
+        Ok(principal)
+    }
+
+    /// Total number of successful legacy-path authentications since startup.
+    /// Used to gauge when the legacy column in `principals` can be dropped
+    /// (PR C). Exposed for future CLI/status endpoints.
+    #[allow(dead_code)]
+    pub fn legacy_hit_count(&self) -> u64 {
+        self.legacy_hits.load(Ordering::Relaxed)
     }
 
     fn authenticate_new(&self, token_id: &str, secret: &str) -> Result<Option<Principal>> {
@@ -155,5 +174,23 @@ mod tests {
         let auth = AuthStore::new(db);
         assert!(auth.authenticate("does-not-exist").is_err());
         assert!(auth.authenticate("airc_deadbeef_nope").is_err());
+    }
+
+    #[test]
+    fn legacy_hit_counter_tracks_successful_legacy_auth() -> Result<()> {
+        let db = store::open(":memory:")?;
+        let auth = AuthStore::new(db);
+        assert_eq!(auth.legacy_hit_count(), 0);
+
+        auth.authenticate("human-token")?;
+        assert_eq!(auth.legacy_hit_count(), 1);
+
+        auth.authenticate("agent-a-token")?;
+        assert_eq!(auth.legacy_hit_count(), 2);
+
+        // Invalid tokens must not bump the counter.
+        let _ = auth.authenticate("does-not-exist");
+        assert_eq!(auth.legacy_hit_count(), 2);
+        Ok(())
     }
 }
