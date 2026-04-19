@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -127,7 +127,7 @@ fn seed_principal(
     token: &str,
     team: &str,
 ) -> Result<()> {
-    connection
+    let inserted = connection
         .execute(
             "INSERT OR IGNORE INTO principals (id, nick, token, team, created_at)
              VALUES (?1, ?2, ?3, ?4, unixepoch())",
@@ -135,28 +135,25 @@ fn seed_principal(
         )
         .context("seed principal")?;
 
-    // Mirror the seeded token into `principal_tokens`. The SEED_LABEL paired
-    // with the UNIQUE (principal_id, label) index keeps this idempotent.
-    let existing: Option<i64> = connection
-        .query_row(
-            "SELECT id FROM principal_tokens WHERE principal_id = ?1 AND label = ?2",
-            params![id, SEED_LABEL],
-            |row| row.get(0),
-        )
-        .optional()
-        .context("check existing seed principal_tokens row")?;
-
-    if existing.is_none() {
-        let (_token_id, token_id_hex, _) = tokens::generate();
-        let token_hash = tokens::hash(token).context("hash seed token")?;
-        connection
-            .execute(
-                "INSERT INTO principal_tokens (principal_id, token_id, token_hash, label, created_at)
-                 VALUES (?1, ?2, ?3, ?4, unixepoch())",
-                params![id, token_id_hex, token_hash, SEED_LABEL],
-            )
-            .context("seed principal_tokens row")?;
+    // Only mirror the hardcoded demo token into `principal_tokens` when this
+    // call actually created the principal row. If the principal already exists
+    // its current `principals.token` may have been rotated away from the
+    // hardcoded default, so hashing `token` here would write the wrong secret
+    // and also block `backfill_principal_tokens` from recording the real
+    // plaintext under the `migrated-legacy` label.
+    if inserted == 0 {
+        return Ok(());
     }
+
+    let (_token_id, token_id_hex, _) = tokens::generate();
+    let token_hash = tokens::hash(token).context("hash seed token")?;
+    connection
+        .execute(
+            "INSERT INTO principal_tokens (principal_id, token_id, token_hash, label, created_at)
+             VALUES (?1, ?2, ?3, ?4, unixepoch())",
+            params![id, token_id_hex, token_hash, SEED_LABEL],
+        )
+        .context("seed principal_tokens row")?;
 
     Ok(())
 }
@@ -287,6 +284,54 @@ mod tests {
         )?;
         assert_eq!(label, MIGRATED_LEGACY_LABEL);
         assert!(tokens::verify("legacy-plaintext", &hash)?);
+        Ok(())
+    }
+
+    #[test]
+    fn reinit_preserves_rotated_plaintext_via_backfill() -> Result<()> {
+        // Simulate a pre-existing DB where a built-in principal's legacy token
+        // was rotated away from the hardcoded seed default before
+        // principal_tokens existed. `init` on such a DB must not silently
+        // hash the stale hardcoded default — it must hash the actual current
+        // `principals.token` via the migrated-legacy backfill.
+        let connection = Connection::open_in_memory()?;
+        connection.execute_batch(
+            "CREATE TABLE principals (
+               id TEXT PRIMARY KEY,
+               nick TEXT NOT NULL,
+               token TEXT UNIQUE NOT NULL,
+               team TEXT,
+               last_seen_seq INTEGER NOT NULL DEFAULT 0,
+               connected_at INTEGER,
+               disconnected_at INTEGER,
+               created_at INTEGER NOT NULL
+             );",
+        )?;
+        connection.execute(
+            "INSERT INTO principals (id, nick, token, team, created_at)
+             VALUES ('human', 'human', 'rotated-secret', 'demo', unixepoch())",
+            [],
+        )?;
+
+        init(&connection)?;
+
+        let (label, hash): (String, String) = connection.query_row(
+            "SELECT label, token_hash FROM principal_tokens WHERE principal_id = 'human'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(
+            label, MIGRATED_LEGACY_LABEL,
+            "pre-existing principal with rotated token must take the migrated-legacy backfill path, not the seed path"
+        );
+        assert!(
+            tokens::verify("rotated-secret", &hash)?,
+            "backfill must hash the actual current plaintext, not the hardcoded default"
+        );
+        assert!(
+            !tokens::verify("human-token", &hash)?,
+            "the hardcoded seed default must not be written for a pre-existing principal"
+        );
         Ok(())
     }
 }
