@@ -4,6 +4,7 @@ mod protocol;
 mod server;
 mod store;
 mod tasks;
+mod tokens;
 
 use anyhow::{Context, Result};
 use server::Server;
