@@ -3,7 +3,17 @@ use rusqlite::{params, Connection};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use crate::tokens;
+
 pub type SharedConnection = Arc<Mutex<Connection>>;
+
+/// Label used to mark `principal_tokens` rows that were backfilled from the
+/// legacy `principals.token` column. The uniqueness constraint below prevents
+/// double backfills even if `init` runs repeatedly.
+const MIGRATED_LEGACY_LABEL: &str = "migrated-legacy";
+
+/// Label used for rows created alongside seeded demo principals.
+const SEED_LABEL: &str = "seed";
 
 pub fn open(path: impl AsRef<Path>) -> Result<SharedConnection> {
     let connection = Connection::open(path).context("open sqlite database")?;
@@ -55,6 +65,24 @@ fn init(connection: &Connection) -> Result<()> {
               created_at INTEGER NOT NULL,
               updated_at INTEGER NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS principal_tokens (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE CASCADE,
+              token_id TEXT UNIQUE NOT NULL,
+              token_hash TEXT NOT NULL,
+              label TEXT,
+              created_at INTEGER NOT NULL,
+              revoked_at INTEGER
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_principal_tokens_principal
+              ON principal_tokens (principal_id);
+
+            -- Guarantees at most one backfill row per principal, even if init
+            -- runs repeatedly against an already-populated database.
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_principal_tokens_principal_label
+              ON principal_tokens (principal_id, label);
             ",
         )
         .context("initialize sqlite schema")?;
@@ -69,6 +97,8 @@ fn init(connection: &Connection) -> Result<()> {
     seed_principal(connection, "agent-1", "agent-1", "test-token-1", "test")?;
     seed_principal(connection, "agent-2", "agent-2", "test-token-2", "test")?;
     seed_principal(connection, "agent-3", "agent-3", "test-token-3", "test")?;
+
+    backfill_principal_tokens(connection)?;
 
     Ok(())
 }
@@ -97,13 +127,34 @@ fn seed_principal(
     token: &str,
     team: &str,
 ) -> Result<()> {
-    connection
+    let inserted = connection
         .execute(
             "INSERT OR IGNORE INTO principals (id, nick, token, team, created_at)
              VALUES (?1, ?2, ?3, ?4, unixepoch())",
             params![id, nick, token, team],
         )
         .context("seed principal")?;
+
+    // Only mirror the hardcoded demo token into `principal_tokens` when this
+    // call actually created the principal row. If the principal already exists
+    // its current `principals.token` may have been rotated away from the
+    // hardcoded default, so hashing `token` here would write the wrong secret
+    // and also block `backfill_principal_tokens` from recording the real
+    // plaintext under the `migrated-legacy` label.
+    if inserted == 0 {
+        return Ok(());
+    }
+
+    let (_token_id, token_id_hex, _) = tokens::generate();
+    let token_hash = tokens::hash(token).context("hash seed token")?;
+    connection
+        .execute(
+            "INSERT INTO principal_tokens (principal_id, token_id, token_hash, label, created_at)
+             VALUES (?1, ?2, ?3, ?4, unixepoch())",
+            params![id, token_id_hex, token_hash, SEED_LABEL],
+        )
+        .context("seed principal_tokens row")?;
+
     Ok(())
 }
 
@@ -130,4 +181,157 @@ fn migrate_principals(connection: &Connection) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Mirror every legacy `principals.token` row into `principal_tokens` as a
+/// `migrated-legacy` entry, keyed by a fresh random `token_id` with the
+/// existing plaintext token hashed as `token_hash`. Principals that already
+/// have ANY `principal_tokens` row are skipped — this covers both restart
+/// idempotency and freshly seeded demo principals whose `seed` row is inserted
+/// by [`seed_principal`] before this function runs. The UNIQUE
+/// `(principal_id, label)` index provides a second line of defence.
+fn backfill_principal_tokens(connection: &Connection) -> Result<()> {
+    let mut select = connection
+        .prepare(
+            "SELECT p.id, p.token
+             FROM principals p
+             LEFT JOIN principal_tokens t ON t.principal_id = p.id
+             WHERE p.token IS NOT NULL AND t.id IS NULL",
+        )
+        .context("prepare principal_tokens backfill query")?;
+
+    let rows = select
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("collect principals needing backfill")?;
+
+    for (principal_id, plaintext) in rows {
+        let (_, token_id_hex, _) = tokens::generate();
+        let token_hash = tokens::hash(&plaintext).context("hash legacy token for backfill")?;
+        connection
+            .execute(
+                "INSERT INTO principal_tokens (principal_id, token_id, token_hash, label, created_at)
+                 VALUES (?1, ?2, ?3, ?4, unixepoch())",
+                params![principal_id, token_id_hex, token_hash, MIGRATED_LEGACY_LABEL],
+            )
+            .context("insert migrated-legacy principal_tokens row")?;
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn init_creates_principal_tokens_table_and_seeds_mirrors() -> Result<()> {
+        let connection = Connection::open_in_memory()?;
+        init(&connection)?;
+
+        let seed_count: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM principal_tokens WHERE label = ?1",
+            params![SEED_LABEL],
+            |row| row.get(0),
+        )?;
+        assert_eq!(seed_count, 7, "every seeded principal should have a row");
+
+        let unique_ids: i64 = connection.query_row(
+            "SELECT COUNT(DISTINCT token_id) FROM principal_tokens",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(unique_ids, seed_count);
+        Ok(())
+    }
+
+    #[test]
+    fn backfill_is_idempotent_across_reinit() -> Result<()> {
+        let connection = Connection::open_in_memory()?;
+        init(&connection)?;
+        let first: i64 =
+            connection.query_row("SELECT COUNT(*) FROM principal_tokens", [], |row| {
+                row.get(0)
+            })?;
+
+        // Simulate a legacy principal inserted before principal_tokens existed.
+        connection.execute(
+            "INSERT INTO principals (id, nick, token, team, created_at)
+             VALUES ('legacy', 'legacy', 'legacy-plaintext', 'ops', unixepoch())",
+            [],
+        )?;
+
+        init(&connection)?;
+        let second: i64 =
+            connection.query_row("SELECT COUNT(*) FROM principal_tokens", [], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(second, first + 1, "one legacy row should be backfilled");
+
+        init(&connection)?;
+        let third: i64 =
+            connection.query_row("SELECT COUNT(*) FROM principal_tokens", [], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(third, second, "backfill must not duplicate rows");
+
+        let (label, hash): (String, String) = connection.query_row(
+            "SELECT label, token_hash FROM principal_tokens WHERE principal_id = 'legacy'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(label, MIGRATED_LEGACY_LABEL);
+        assert!(tokens::verify("legacy-plaintext", &hash)?);
+        Ok(())
+    }
+
+    #[test]
+    fn reinit_preserves_rotated_plaintext_via_backfill() -> Result<()> {
+        // Simulate a pre-existing DB where a built-in principal's legacy token
+        // was rotated away from the hardcoded seed default before
+        // principal_tokens existed. `init` on such a DB must not silently
+        // hash the stale hardcoded default — it must hash the actual current
+        // `principals.token` via the migrated-legacy backfill.
+        let connection = Connection::open_in_memory()?;
+        connection.execute_batch(
+            "CREATE TABLE principals (
+               id TEXT PRIMARY KEY,
+               nick TEXT NOT NULL,
+               token TEXT UNIQUE NOT NULL,
+               team TEXT,
+               last_seen_seq INTEGER NOT NULL DEFAULT 0,
+               connected_at INTEGER,
+               disconnected_at INTEGER,
+               created_at INTEGER NOT NULL
+             );",
+        )?;
+        connection.execute(
+            "INSERT INTO principals (id, nick, token, team, created_at)
+             VALUES ('human', 'human', 'rotated-secret', 'demo', unixepoch())",
+            [],
+        )?;
+
+        init(&connection)?;
+
+        let (label, hash): (String, String) = connection.query_row(
+            "SELECT label, token_hash FROM principal_tokens WHERE principal_id = 'human'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(
+            label, MIGRATED_LEGACY_LABEL,
+            "pre-existing principal with rotated token must take the migrated-legacy backfill path, not the seed path"
+        );
+        assert!(
+            tokens::verify("rotated-secret", &hash)?,
+            "backfill must hash the actual current plaintext, not the hardcoded default"
+        );
+        assert!(
+            !tokens::verify("human-token", &hash)?,
+            "the hardcoded seed default must not be written for a pre-existing principal"
+        );
+        Ok(())
+    }
 }

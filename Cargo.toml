@@ -5,6 +5,8 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1"
+argon2 = "0.5"
+rand = "0.8"
 rustls-pemfile = "2"
 rusqlite = { version = "0.32", features = ["bundled"] }
 tokio = { version = "1", features = ["full"] }
