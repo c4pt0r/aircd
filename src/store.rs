@@ -10,7 +10,7 @@ pub type SharedConnection = Arc<Mutex<Connection>>;
 /// Label used to mark `principal_tokens` rows that were backfilled from the
 /// legacy `principals.token` column. The uniqueness constraint below prevents
 /// double backfills even if `init` runs repeatedly.
-const LEGACY_BACKFILL_LABEL: &str = "legacy-backfill";
+const MIGRATED_LEGACY_LABEL: &str = "migrated-legacy";
 
 /// Label used for rows created alongside seeded demo principals.
 const SEED_LABEL: &str = "seed";
@@ -187,7 +187,7 @@ fn migrate_principals(connection: &Connection) -> Result<()> {
 }
 
 /// Mirror every legacy `principals.token` row into `principal_tokens` as a
-/// `legacy-backfill` entry, keyed by a fresh random `token_id` with the
+/// `migrated-legacy` entry, keyed by a fresh random `token_id` with the
 /// existing plaintext token hashed as `token_hash`. Principals that already
 /// have ANY `principal_tokens` row are skipped — this covers both restart
 /// idempotency and freshly seeded demo principals whose `seed` row is inserted
@@ -217,9 +217,9 @@ fn backfill_principal_tokens(connection: &Connection) -> Result<()> {
             .execute(
                 "INSERT INTO principal_tokens (principal_id, token_id, token_hash, label, created_at)
                  VALUES (?1, ?2, ?3, ?4, unixepoch())",
-                params![principal_id, token_id_hex, token_hash, LEGACY_BACKFILL_LABEL],
+                params![principal_id, token_id_hex, token_hash, MIGRATED_LEGACY_LABEL],
             )
-            .context("insert legacy-backfill principal_tokens row")?;
+            .context("insert migrated-legacy principal_tokens row")?;
     }
 
     Ok(())
@@ -285,7 +285,7 @@ mod tests {
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        assert_eq!(label, LEGACY_BACKFILL_LABEL);
+        assert_eq!(label, MIGRATED_LEGACY_LABEL);
         assert!(tokens::verify("legacy-plaintext", &hash)?);
         Ok(())
     }
